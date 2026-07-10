@@ -141,7 +141,8 @@ def do_one_write(provider: Any, iteration: int) -> tuple[str, Optional[str]]:
     try:
         parsed = json.loads(primary_result)
         if isinstance(parsed, dict) and (parsed.get("error") or parsed.get("status") == "error"):
-            return primary_result, f"primary_error:{type(parsed.get('error')).__name__}"
+            err = parsed.get("error") or parsed.get("message") or "unknown"
+            return primary_result, f"primary_error:{err}"
     except Exception:
         pass
     return primary_result, None
