@@ -38,6 +38,90 @@ def _load_store() -> Any:
     return ShadowEvidenceStore(_report_path())
 
 
+def cmd_preflight(args) -> None:
+    """Check shadow/Fuli readiness without mutating memory or downloading models."""
+    import importlib
+    import time
+    from plugins.memory import load_memory_provider
+
+    home = get_hermes_home()
+    cfg = _provider_config()
+    primary_name = cfg.get("primary_provider", "honcho")
+    secondary_name = cfg.get("secondary_provider", "fuli")
+
+    print("\nShadow memory preflight")
+    print("─" * 40)
+    print(f"  Hermes home:        {home}")
+    print(f"  Primary:            {primary_name}")
+    print(f"  Secondary:          {secondary_name}")
+    print(f"  Enabled:            {cfg.get('enabled', False)}")
+    print(f"  Mirror writes:      {cfg.get('mirror_writes', False)}")
+    print(f"  Compare reads:      {cfg.get('compare_reads', False)}")
+    print(f"  Sample rate:        {cfg.get('sample_rate', 0.0)}")
+    print(f"  Timeout:            {cfg.get('timeout_ms', 250)} ms")
+    print(f"  Capture content:    {cfg.get('capture_content', False)}")
+    print(f"  Namespace:          {cfg.get('namespace', 'hermes:default')}")
+
+    # Primary availability
+    primary = load_memory_provider(primary_name)
+    print(f"  Primary available:  {primary is not None and primary.is_available()}")
+
+    # Fuli import path and version/commit
+    fuli_module = importlib.import_module("fuli")
+    fuli_path = getattr(fuli_module, "__file__", "unknown")
+    print(f"  Fuli import path:   {fuli_path}")
+    fuli_version = getattr(fuli_module, "__version__", "unknown")
+    print(f"  Fuli version:       {fuli_version}")
+    try:
+        import subprocess
+        fuli_commit = (
+            subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=str(Path(fuli_path).parent.parent),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            .stdout
+            .strip()
+        )
+        print(f"  Fuli commit:        {fuli_commit or 'unknown'}")
+    except Exception:
+        print("  Fuli commit:        unknown")
+
+    # Model cache (sentence-transformers uses the Hugging Face cache)
+    model = cfg.get("embedding_model") or "sentence-transformers/all-MiniLM-L6-v2"
+    cache_dir = Path.home() / ".cache" / "huggingface" / "hub"
+    normalized = "models--" + model.replace("/", "--")
+    model_cached = (cache_dir / normalized).exists()
+    print(f"  Model cached:       {model_cached} ({model})")
+
+    # Writable directories
+    memories_dir = home / "memories"
+    shadow_dir = home / "shadow"
+    try:
+        memories_dir.mkdir(parents=True, exist_ok=True)
+        shadow_dir.mkdir(parents=True, exist_ok=True)
+        print(f"  DB dir writable:    {memories_dir}")
+        print(f"  Shadow config dir:  {shadow_dir}")
+    except Exception as e:
+        print(f"  DB dir writable:    ERROR {e}")
+
+    # Evidence store counts
+    evidence_path = home / "memories" / "shadow.db"
+    if evidence_path.exists():
+        try:
+            store = _load_store()
+            report = store.report()
+            print(f"  Mirrored writes:    {report['writes']['attempted']}")
+            print(f"  Read samples:       {report['reads']['sample_count']}")
+        except Exception as e:
+            print(f"  Evidence store:     ERROR {e}")
+    else:
+        print("  Evidence store:     not created yet")
+    print()
+
+
 def cmd_status(args) -> None:
     """Show shadow provider status."""
     cfg = _provider_config()
@@ -131,6 +215,7 @@ def cmd_namespace(args) -> None:
 def register_cli(subparser) -> None:
     """Build the ``hermes shadow`` argparse tree."""
     subs = subparser.add_subparsers(dest="shadow_command")
+    subs.add_parser("preflight", help="Check shadow/Fuli readiness without mutating memory")
     subs.add_parser("status", help="Show shadow provider status")
     subs.add_parser("report", help="Show comparison report")
     compare = subs.add_parser("compare", help="Run one-off comparison query")
@@ -142,7 +227,9 @@ def register_cli(subparser) -> None:
 
 def cmd_dispatch(args) -> None:
     cmd = getattr(args, "shadow_command", None)
-    if cmd == "status":
+    if cmd == "preflight":
+        cmd_preflight(args)
+    elif cmd == "status":
         cmd_status(args)
     elif cmd == "report":
         cmd_report(args)
@@ -151,4 +238,4 @@ def cmd_dispatch(args) -> None:
     elif cmd == "namespace":
         cmd_namespace(args)
     else:
-        print("\n  Usage: hermes shadow {status|report|compare|namespace}\n")
+        print("\n  Usage: hermes shadow {preflight|status|report|compare|namespace}\n")

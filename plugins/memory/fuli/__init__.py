@@ -348,6 +348,9 @@ class FuliMemoryProvider(MemoryProvider):
         if db_path is None:
             raise RuntimeError("Fuli db_path is not set")
 
+        # Pre-populate the bridge loop so the first call doesn't pay loop startup cost.
+        self._bridge.run(asyncio.sleep(0), timeout=5.0)
+
         async def _make() -> Any:
             embedder = self._embedder if self._embedder is not None else self._create_embedder()
             return await create_provider(db_path, embedder=embedder, enable_sync=False)
