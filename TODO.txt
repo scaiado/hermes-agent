@@ -53,8 +53,8 @@
 - [x] Create dedicated `shadow-pilot` profile (did not modify default `~/.hermes/config.yaml`)
 - [x] Run `hermes shadow preflight` in the dedicated profile (passed static checks)
 - [x] Add dynamic primary probe to the pilot script
-- [ ] Confirm Honcho primary endpoint `http://100.77.121.91:8000` is reachable and writes successfully
-- [ ] Re-run `hermes shadow preflight` and primary probe after endpoint is restored
+- [x] Confirm Honcho primary endpoint `http://100.77.121.91:8000` is reachable and writes successfully
+- [x] Re-run `hermes shadow preflight` and primary probe after endpoint is restored
 - [ ] Launch the 4–8 hour conservative mirrored-write pilot
 - [ ] Collect exact evidence and update `progress.md` / `TODO.txt`
 - [ ] Do not activate normal user profile

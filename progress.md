@@ -4,6 +4,17 @@
 
 The conservative shadow-pilot was **not launched** for the planned 4–8 hour window. The preflight static checks passed, but a dynamic write probe against the Honcho primary failed with `Connection refused` to `http://100.77.121.91:8000`. Per the pilot protocol, a non-functional primary is a hard stop.
 
+### 2026-07-10 recheck — primary restored, pilot now ready
+
+A follow-up full recheck was run after the user reported the Honcho endpoint was restored.
+
+- `honcho_conclude`: 5/5 successes (`Conclusion saved for user`)
+- `honcho_profile`: 4/5 successes (1st attempt still initializing, then stable)
+- Fuli secondary: add calls completed within ~3s on first model load, then ~20ms; search returned results; diagnostics showed 57 active memories, 49 indexed, 8 pending
+- Fuli embedding dimension mismatch was fixed locally by writing `~/.hermes/profiles/shadow-pilot/fuli/config.json` with `sentence-transformers/all-MiniLM-L6-v2`
+
+The primary is healthy enough to launch the conservative mirrored-write pilot. The secondary will experience a one-time model-load cost (timeout at the 250ms shadow timeout), after which writes are sub-30ms.
+
 ### Preflight checks (passed)
 
 ```text
