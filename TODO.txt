@@ -31,7 +31,7 @@
 - [x] Add tests proving safety invariants
 
 ## Documentation and discipline
-- [x] Update `progress.md` with environment boundary
+- [x] Update `progress.md` with environment boundary and pilot status
 - [x] Run lint/type checks/tests in the appropriate environment
 - [x] Commit in small logical commits
 - [x] Verify push targets before pushing
@@ -49,5 +49,13 @@
 - [x] Verify commits are preserved on remote
 
 ## Pilot
-- [ ] Go/no-go decision for mirrored-write pilot (user-controlled, not auto-activated)
+- [x] User go/no-go: granted
+- [x] Create dedicated `shadow-pilot` profile (did not modify default `~/.hermes/config.yaml`)
+- [x] Run `hermes shadow preflight` in the dedicated profile (passed static checks)
+- [x] Add dynamic primary probe to the pilot script
+- [ ] Confirm Honcho primary endpoint `http://100.77.121.91:8000` is reachable and writes successfully
+- [ ] Re-run `hermes shadow preflight` and primary probe after endpoint is restored
+- [ ] Launch the 4–8 hour conservative mirrored-write pilot
+- [ ] Collect exact evidence and update `progress.md` / `TODO.txt`
 - [ ] Do not activate normal user profile
+- [ ] Do not enable `compare_reads` until the pilot report is reviewed

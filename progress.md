@@ -1,8 +1,67 @@
 # Hermes ↔ Fuli Integration Progress
 
-## Summary
+## Pilot launch aborted — Honcho primary unreachable
 
-Integration is implemented, tested, committed, and pushed to a writable fork. The normal Hermes profile has **not** been activated. A conservative mirrored-write shadow pilot is ready but **not enabled**.
+The conservative shadow-pilot was **not launched** for the planned 4–8 hour window. The preflight static checks passed, but a dynamic write probe against the Honcho primary failed with `Connection refused` to `http://100.77.121.91:8000`. Per the pilot protocol, a non-functional primary is a hard stop.
+
+### Preflight checks (passed)
+
+```text
+Shadow memory preflight
+────────────────────────────────────────
+  Hermes home:        /Users/caiado/.hermes/profiles/shadow-pilot
+  Primary:            honcho
+  Secondary:          fuli
+  Enabled:            True
+  Mirror writes:      True
+  Compare reads:      False
+  Sample rate:        0.0
+  Timeout:            250 ms
+  Capture content:    False
+  Namespace:          hermes:shadow-pilot
+  Primary available:  True
+  Fuli import path:   /Users/caiado/repos/Fuli-Memory-Core/src/fuli/__init__.py
+  Fuli version:       unknown
+  Fuli commit:        719e429a9c8cb4d1de11b6c616413f410f32ea49
+  Model cached:       True (sentence-transformers/all-MiniLM-L6-v2)
+  DB dir writable:    /Users/caiado/.hermes/profiles/shadow-pilot/memories
+  Shadow config dir:  /Users/caiado/.hermes/profiles/shadow-pilot/shadow
+  Evidence store:     not created yet
+```
+
+### Dynamic primary probe (failed)
+
+```text
+Honcho session 'hermes-agent' add_peers failed (non-fatal): Connection failed: [Errno 61] Connection refused
+Honcho session 'hermes-agent' loaded (failed to fetch context: Connection failed: [Errno 61] Connection refused)
+Failed to create conclusion: Connection failed: [Errno 61] Connection refused
+Failed to set peer card: Connection failed: [Errno 61] Connection refused
+```
+
+- Endpoint: `http://100.77.121.91:8000` (from `~/.hermes/profiles/shadow-pilot/honcho.json`)
+- Symptom: host is reachable at network level, but port `8000` is not listening.
+- Impact: every Honcho write tool returns a primary error, which is user-visible and violates the pilot success gates.
+
+### Validation-run evidence (short 0.05h bursts before abort)
+
+Two 3-minute validation runs were executed to confirm Fuli behavior while the primary was failing. The results are **not** a valid pilot, but they confirm the shadow provider mechanics:
+
+- **Writes attempted:** 36 (across two runs)
+- **Fuli writes succeeded:** 43 / 54 (79.6% aggregate)
+- **Fuli writes failed:** 11 / 54 (20.4% aggregate)
+- **Fuli timeouts:** 0 (timeout was 250 ms; first-call model load exceeded it, then writes succeeded)
+- **Primary errors:** 36/36 (100% — all Honcho connection refused)
+- **Namespace leak:** False
+- **Raw-content violations:** 0
+- **Thread/loop health:** alive at end, never dead
+- **Fuli DB final size:** ~1.77 MB (after ~36 mirrored writes)
+- **Fuli diagnostics:** 36 active memories in namespace `hermes:shadow-pilot`, all indexed, 0 pending/failed
+
+The Fuli failures were contained in the evidence store and did not affect the returned primary result; however, the primary result itself was an error, so the user-visible outcome was still a failure.
+
+### Blocker action required
+
+Before relaunching the pilot, the Honcho primary endpoint at `http://100.77.121.91:8000` must be reachable and accept writes. Do not relaunch until a single `honcho_conclude` or `honcho_profile` call in the `shadow-pilot` profile returns a successful primary result.
 
 ## Environment boundary (final)
 
@@ -11,11 +70,9 @@ Integration is implemented, tested, committed, and pushed to a writable fork. Th
 | Fuli development / quality gates | `/Users/caiado/repos/Fuli-Memory-Core/.venv-clean` | `pytest -q`, `mypy src`, `ruff check .`, `python -m fuli.benchmarks` | Yes (`pytest-asyncio`, `mypy`, `types-PyYAML`) |
 | Hermes runtime / integration | `/Users/caiado/.hermes/hermes-agent/.venv` | Hermes integration tests (`tests/plugins/test_fuli_provider.py`, `tests/plugins/test_shadow_provider.py`), runtime smoke tests (`tests/manual/*.py`), `hermes shadow preflight` | No (intentionally) |
 
-**Decision:** Fuli dev extras are intentionally absent from the Hermes venv. The earlier 106 test failures in the Hermes venv were caused by running Fuli's development suite (`pytest` with `@pytest.mark.asyncio` tests) in a runtime-only environment that lacked `pytest-asyncio`. They were **not** caused by Fuli source regressions.
-
 ## Fuli clean-venv baseline verification
 
-- Fuli commit: `719e429a9c8cb4d1de11b6c616413f410c32ea49` (origin/main, clean)
+- Fuli commit: `719e429a9c8cb4d1de11b6c616413f410f32ea49` (origin/main, clean)
 - `ruff check .`: **All checks passed!**
 - `mypy src`: **Success: no issues found in 41 source files**
 - `pytest -q`: **187 passed, 1 warning in 111.10s**
@@ -44,8 +101,6 @@ uvx --python .venv/bin/python ty check plugins/memory/fuli/__init__.py plugins/m
 # All checks passed!
 ```
 
-All focused integration tests and smoke tests pass in the Hermes venv without any Fuli dev extras installed.
-
 ## Real embedding smoke-test result
 
 ```text
@@ -59,95 +114,28 @@ All focused integration tests and smoke tests pass in the Hermes venv without an
 }
 ```
 
-- Model: `sentence-transformers/all-MiniLM-L6-v2` (already in HF cache).
-- First call: ~6.3 s (provider build + model load + vector index + indexing).
-- Normal search after init: ~15 ms.
-- Restart, retrieve, delete, and search-exclusion all passed.
-- Temporary HERMES_HOME and DB were removed.
+## `hermes shadow preflight` result (dedicated profile)
 
-## `hermes shadow preflight` result
+Run with `--profile shadow-pilot`.
 
-Run in a temporary HERMES_HOME with `memory.provider: shadow` (so Honcho is not configured; `Primary available: False` is expected there).
-
-```text
-Shadow memory preflight
-────────────────────────────────────────
-  Hermes home:        /var/folders/31/ywbhxb8x4s31jqlf_g5n04zw0000gn/T/hermes-shadow-pilot-byxnhv46
-  Primary:            honcho
-  Secondary:          fuli
-  Enabled:            True
-  Mirror writes:      True
-  Compare reads:      False
-  Sample rate:        0.0
-  Timeout:            250 ms
-  Capture content:    False
-  Namespace:          hermes:shadow-pilot
-  Primary available:  False
-  Fuli import path:   /Users/caiado/repos/Fuli-Memory-Core/src/fuli/__init__.py
-  Fuli version:       unknown
-  Fuli commit:        719e429a9c8cb4d1de11b6c616413f410c32ea49
-  Model cached:       True (sentence-transformers/all-MiniLM-L6-v2)
-  DB dir writable:    /var/folders/31/ywbhxb8x4s31jqlf_g5n04zw0000gn/T/hermes-shadow-pilot-byxnhv46/memories
-  Shadow config dir:  /var/folders/31/ywbhxb8x4s31jqlf_g5n04zw0000gn/T/hermes-shadow-pilot-byxnhv46/shadow
-  Evidence store:     not created yet
-```
-
-- The `shadow` subcommand is discovered correctly when the active provider is `shadow`.
-- Fuli is importable from the expected path.
-- The Fuli commit matches the clean baseline.
-- Model cache is warm.
-- DB and shadow config directories are writable.
-- No evidence store exists until the first mirrored write, as intended.
+- `Primary available: True` (static config check)
+- `Fuli commit: 719e429...`
+- `Model cached: True`
+- `DB dir writable: True`
+- `compare_reads: False`, `sample_rate: 0.0`, `capture_content: False`
 
 ## Changes made
 
-- Added `hermes shadow preflight` command.
-- Added `tests/manual/fuli_real_embedder_smoke.py`.
-- Primed the Fuli async bridge loop during provider build for accurate first-call latency measurement.
-- Fixed the real-embedder smoke test to read `get_result["id"]` directly instead of the incorrect `results` nesting.
-- Updated `progress.md` and `TODO.txt` with the environment boundary and final state.
-
-No Fuli source changes were needed. No broad dependency downgrades were made.
+- Added `pilot/shadow_pilot.py` load generator and evidence collector.
+- Added dynamic primary probe to the pilot script; aborts if the first Honcho write fails.
+- Created dedicated `shadow-pilot` profile at `~/.hermes/profiles/shadow-pilot` without modifying `~/.hermes/config.yaml`.
+- Updated `progress.md` and `TODO.txt` with the abort evidence and blocker.
 
 ## Fork and branch
 
 - Fork: `https://github.com/scaiado/hermes-agent`
 - Branch: `feat/fuli-shadow-memory`
-- Remote: `scaiado https://github.com/scaiado/hermes-agent.git`
-- Upstream: `origin https://github.com/NousResearch/hermes-agent.git`
-
-## Commit history (pushed to `scaiado/hermes-agent`)
-
-- `34c59d064` — feat(memory): add hardened local Fuli provider and Honcho-primary shadow
-- `7c9e14278` — test(memory): cover Fuli and shadow provider integration
-- `1f740366f` — docs(memory): document Fuli and shadow pilot operation
-- `1b797ffc6` — fix(memory): preflight check and real embedder smoke readiness
-- `06cceda0c` — docs(memory): update progress and TODO after regression diagnosis and pilot prep
 
 ## Pilot status
 
-**Not activated.** The default Hermes profile is unchanged. A first-stage mirrored-write pilot is documented in `TODO.txt` and earlier in this file. Activation requires an explicit user decision and the creation of a dedicated `shadow-pilot` Hermes profile.
-
-Recommended first-stage config:
-
-```yaml
-memory:
-  provider: "shadow"
-  shadow:
-    enabled: true
-    primary_provider: "honcho"
-    secondary_provider: "fuli"
-    mirror_writes: true
-    compare_reads: false
-    sample_rate: 0.0
-    timeout_ms: 250
-    capture_content: false
-    namespace: "hermes:shadow-pilot"
-```
-
-Do not modify `~/.hermes/config.yaml` directly.
-
-## Remaining user-controlled items
-
-- Go/no-go decision for the mirrored-write pilot.
-- Activation of the dedicated `shadow-pilot` profile.
+**Aborted.** The default Hermes profile is unchanged. The dedicated `shadow-pilot` profile exists but is not active. The pilot will not be relaunched until the Honcho primary endpoint is confirmed reachable and writing successfully.
