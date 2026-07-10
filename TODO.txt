@@ -1,0 +1,28 @@
+# Hermes ↔ Fuli Integration TODO
+
+## Direct Fuli provider
+- [x] Refactor `plugins/memory/fuli/__init__.py` to lazy initialization
+- [x] Replace global async bridge with per-provider instance bridge
+- [x] Add bounded per-call timeout to async bridge
+- [x] Add safe shutdown (storage close, loop stop, thread join)
+- [x] Verify `utils.atomic_json_write` exists or replace with safe write
+- [x] Register Fuli in `hermes_cli/memory_providers.py`
+- [x] Add tests for discovery, manifest, lazy init, CRUD, reinforce, diagnostics
+- [x] Add isolated smoke test with temporary Hermes home
+
+## Shadow provider
+- [x] Create `plugins/memory/shadow/` plugin
+- [x] Load primary (Honcho) and secondary (Fuli) providers by name
+- [x] Preserve Honcho tool schemas and dispatch
+- [x] Mirror writes to Fuli best-effort
+- [x] Sample and compare reads after primary result
+- [x] Add SQLite evidence store for comparisons
+- [x] Add CLI/report commands
+- [x] Add tests proving safety invariants
+
+## Documentation and discipline
+- [x] Update `progress.md` with results
+- [x] Run lint/type checks/tests
+- [x] Commit in small logical commits
+- [x] Verify push targets before pushing
+- [ ] Provide exact safe commands for enabling local shadow pilot
