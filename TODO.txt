@@ -9,6 +9,7 @@
 - [x] Register Fuli in `hermes_cli/memory_providers.py`
 - [x] Add tests for discovery, manifest, lazy init, CRUD, reinforce, diagnostics
 - [x] Add isolated smoke test with temporary Hermes home
+- [x] Add real-embedding smoke test with temporary Hermes home and DB
 
 ## Shadow provider
 - [x] Create `plugins/memory/shadow/` plugin
@@ -18,6 +19,7 @@
 - [x] Sample and compare reads after primary result
 - [x] Add SQLite evidence store for comparisons
 - [x] Add CLI/report commands
+- [x] Add `hermes shadow preflight` command
 - [x] Add tests proving safety invariants
 
 ## Documentation and discipline
@@ -25,4 +27,19 @@
 - [x] Run lint/type checks/tests
 - [x] Commit in small logical commits
 - [x] Verify push targets before pushing
-- [ ] Provide exact safe commands for enabling local shadow pilot
+- [x] Provide exact safe commands for enabling local shadow pilot
+
+## Environment alignment
+- [x] Create clean Fuli venv and confirm 187-passing baseline
+- [x] Identify Hermes venv regression cause (missing `pytest-asyncio`, `mypy`, `types-PyYAML`)
+- [ ] Install Fuli dev deps into Hermes venv (requires user consent)
+- [ ] Re-run Fuli package gates in Hermes venv after install
+
+## Fork / branch
+- [x] Fork `NousResearch/hermes-agent` to `scaiado/hermes-agent`
+- [x] Push integration branch `feat/fuli-shadow-memory`
+- [x] Verify commits are preserved on remote
+
+## Pilot
+- [ ] Go/no-go decision for mirrored-write pilot
+- [ ] Do not activate normal user profile
