@@ -136,10 +136,88 @@ HINDSIGHT = MemoryProvider(
 )
 
 
+FULI = MemoryProvider(
+    name="fuli",
+    label="Fuli",
+    fields=(
+        ProviderField(
+            key="db_path",
+            label="Database path",
+            default="",
+            description="Path to the Fuli SQLite database. Empty means <HERMES_HOME>/memories/fuli.db.",
+            placeholder="/path/to/fuli.db",
+        ),
+        ProviderField(
+            key="namespace",
+            label="Namespace",
+            default="hermes:default",
+            description="Namespace used for Hermes memories inside Fuli.",
+            placeholder="hermes:default",
+        ),
+        ProviderField(
+            key="embedding_provider",
+            label="Embedding provider",
+            kind=KIND_SELECT,
+            default="local",
+            description="Backend used for embedding generation.",
+            options=(
+                ProviderFieldOption("local", "Local (sentence-transformers)", "Runs on this machine."),
+                ProviderFieldOption("ollama", "Ollama", "Connect to an Ollama server."),
+            ),
+        ),
+        ProviderField(
+            key="embedding_model",
+            label="Embedding model",
+            default="",
+            description="Model name for the chosen embedding provider (empty = Fuli default).",
+            placeholder="sentence-transformers/all-MiniLM-L6-v2",
+        ),
+        ProviderField(
+            key="device",
+            label="Device",
+            kind=KIND_SELECT,
+            default="cpu",
+            description="Device for local embeddings.",
+            options=(
+                ProviderFieldOption("cpu", "CPU"),
+                ProviderFieldOption("mps", "MPS (Apple Silicon)"),
+                ProviderFieldOption("cuda", "CUDA"),
+            ),
+        ),
+        ProviderField(
+            key="ollama_host",
+            label="Ollama host",
+            default="http://localhost:11434",
+            description="Ollama server URL (only used when embedding provider is Ollama).",
+            placeholder="http://localhost:11434",
+        ),
+        ProviderField(
+            key="lazy_init",
+            label="Lazy initialization",
+            kind=KIND_SELECT,
+            default="true",
+            description="Defer provider build until first use to avoid model downloads at startup.",
+            options=(
+                ProviderFieldOption("true", "On", "Recommended: only build on first tool call."),
+                ProviderFieldOption("false", "Off", "Build at session start."),
+            ),
+        ),
+        ProviderField(
+            key="timeout_ms",
+            label="Call timeout (ms)",
+            default="5000",
+            description="Maximum time per Fuli operation in milliseconds.",
+            placeholder="5000",
+        ),
+    ),
+)
+
+
 # Registry of providers that expose a desktop config surface. Providers without
 # an entry here (e.g. ``builtin``) simply render no config panel.
 MEMORY_PROVIDERS: dict[str, MemoryProvider] = {
     HINDSIGHT.name: HINDSIGHT,
+    FULI.name: FULI,
 }
 
 
