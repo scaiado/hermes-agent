@@ -1,0 +1,4 @@
+name: fuli
+version: 1.0.0
+description: "Fuli — local canonical memory for Tiny Little Lab (SQLite + embeddings + lifecycle)."
+pip_dependencies: []
