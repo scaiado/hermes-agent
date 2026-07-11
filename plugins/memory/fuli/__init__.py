@@ -676,16 +676,22 @@ class FuliMemoryProvider(MemoryProvider):
                     break
             if last_user:
                 self._bridge.run(
-                    self._provider.add(last_user, source="user", namespace=self._namespace, tags=["session_end"]),
+                    self._add_with_fallback(last_user, source="user", namespace=self._namespace, tags=["session_end"]),
                     timeout=self._timeout_ms / 1000.0,
                 )
             if last_assistant:
                 self._bridge.run(
-                    self._provider.add(last_assistant, source="agent", namespace=self._namespace, tags=["session_end"]),
+                    self._add_with_fallback(last_assistant, source="agent", namespace=self._namespace, tags=["session_end"]),
                     timeout=self._timeout_ms / 1000.0,
                 )
         except Exception as exc:
             logger.debug("Fuli on_session_end failed: %s", exc)
+
+    async def _add_with_fallback(self, content: str, source: str, namespace: str, **metadata: Any) -> Any:
+        """Use add_with_status if available, otherwise fall back to legacy add()."""
+        if hasattr(self._provider, "add_with_status"):
+            return await self._provider.add_with_status(content, source=source, namespace=namespace, **metadata)
+        return await self._provider.add(content, source=source, namespace=namespace, **metadata)
 
     def backup_paths(self) -> List[str]:
         """Declare the Fuli database so `hermes backup` captures it."""
@@ -710,18 +716,15 @@ class FuliMemoryProvider(MemoryProvider):
         atomic_json_write(cfg_path, existing, mode=0o600)
 
     def shutdown(self) -> None:
-        """Clean shutdown: close provider storage, stop the bridge, join thread."""
+        """Clean shutdown: stop the async bridge with a bounded wait."""
         try:
             provider = self._provider
-            if provider is not None:
-                self._provider = None
-                try:
-                    self._bridge.run(provider.storage.close(), timeout=5.0)
-                except Exception as exc:
-                    logger.debug("Fuli storage close failed: %s", exc)
+            if provider is not None and hasattr(provider, "shutdown"):
+                self._bridge.run(provider.shutdown(), timeout=5.0)
         except Exception as exc:
-            logger.debug("Fuli shutdown provider close failed: %s", exc)
+            logger.debug("Fuli provider shutdown failed: %s", exc)
         finally:
+            self._provider = None
             self._bridge.stop(join_timeout=3.0)
 
     # -- Test hooks ------------------------------------------------------------
