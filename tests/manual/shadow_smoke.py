@@ -10,10 +10,14 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 import tempfile
 import threading
 from pathlib import Path
 from typing import Any
+
+# Make the Hermes repo root importable so plugins.memory and pilot can be found.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from agent.memory_provider import MemoryProvider
 

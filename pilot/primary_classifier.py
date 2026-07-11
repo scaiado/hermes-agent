@@ -123,7 +123,7 @@ def classify_honcho_result(raw: str, latency_ms: float = 0.0) -> PrimaryResult:
                 latency_ms=latency_ms,
             )
         # Positive success indicators.
-        if status == "success" or "result" in parsed or "id" in parsed or "memory_id" in parsed or "created_at" in parsed or "conclusion_id" in parsed:
+        if status == "success" or parsed.get("ok") is True or "result" in parsed or "id" in parsed or "memory_id" in parsed or "created_at" in parsed or "conclusion_id" in parsed:
             return PrimaryResult(
                 raw=raw,
                 status=PrimaryStatus.SUCCESS,
