@@ -20,16 +20,12 @@ from typing import Any, Dict, List, Optional
 
 
 class ShadowEvidenceStore:
-    def __init__(self, db_path: Path | str) -> None:
-        self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_schema()
-
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA busy_timeout = 5000")
         return conn
 
     def _init_schema(self) -> None:
@@ -69,6 +65,50 @@ class ShadowEvidenceStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS diagnostic_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    namespace TEXT NOT NULL,
+                    operation TEXT,
+                    event_type TEXT NOT NULL
+                )
+                """
+            )
+
+    def _migrate_add_columns(self) -> None:
+        """Add columns added after the initial schema without dropping tables."""
+        with self._connect() as conn:
+            existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(mirrored_writes)")}
+            if "correlation_id" not in existing_cols:
+                conn.execute("ALTER TABLE mirrored_writes ADD COLUMN correlation_id TEXT")
+            if "fuli_memory_id" not in existing_cols:
+                conn.execute("ALTER TABLE mirrored_writes ADD COLUMN fuli_memory_id TEXT")
+            if "metadata" not in existing_cols:
+                conn.execute("ALTER TABLE mirrored_writes ADD COLUMN metadata TEXT")
+            existing_diag = {row[1] for row in conn.execute("PRAGMA table_info(diagnostic_events)")}
+            if "correlation_id" not in existing_diag:
+                conn.execute("ALTER TABLE diagnostic_events ADD COLUMN correlation_id TEXT")
+            if "primary_status" not in existing_diag:
+                conn.execute("ALTER TABLE diagnostic_events ADD COLUMN primary_status TEXT")
+            if "error_message" not in existing_diag:
+                conn.execute("ALTER TABLE diagnostic_events ADD COLUMN error_message TEXT")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_mirrored_writes_corr ON mirrored_writes(correlation_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_mirrored_writes_ns ON mirrored_writes(namespace)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_diagnostic_events_corr ON diagnostic_events(correlation_id)"
+            )
+
+    def __init__(self, db_path: Path | str) -> None:
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_schema()
+        self._migrate_add_columns()
 
     @staticmethod
     def fingerprint(text: str) -> str:
@@ -87,14 +127,17 @@ class ShadowEvidenceStore:
         shadow_error: Optional[str],
         latency_ms: float,
         content_fingerprint: Optional[str] = None,
+        correlation_id: Optional[str] = None,
+        fuli_memory_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO mirrored_writes
                 (timestamp, namespace, operation, primary_success, shadow_success,
-                 shadow_error, latency_ms, content_fingerprint)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 shadow_error, latency_ms, content_fingerprint, correlation_id, fuli_memory_id, metadata)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     self._now(),
@@ -105,8 +148,59 @@ class ShadowEvidenceStore:
                     shadow_error,
                     latency_ms,
                     content_fingerprint,
+                    correlation_id,
+                    fuli_memory_id,
+                    json.dumps(metadata or {}),
                 ),
             )
+
+    def record_diagnostic_event(
+        self,
+        namespace: str,
+        operation: str,
+        event_type: str,
+        correlation_id: Optional[str] = None,
+        primary_status: Optional[str] = None,
+        error_message: Optional[str] = None,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO diagnostic_events
+                (timestamp, namespace, operation, event_type, correlation_id, primary_status, error_message)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    self._now(),
+                    namespace,
+                    operation,
+                    event_type,
+                    correlation_id,
+                    primary_status,
+                    error_message,
+                ),
+            )
+
+    def query_by_correlation(self, correlation_id: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM mirrored_writes WHERE correlation_id = ? LIMIT 1",
+                (correlation_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return dict(row)
+
+    def diagnostic_summary(self) -> Dict[str, Any]:
+        with self._connect() as conn:
+            total = conn.execute("SELECT COUNT(*) FROM diagnostic_events").fetchone()[0]
+            by_type = {
+                row["event_type"]: row["cnt"]
+                for row in conn.execute(
+                    "SELECT event_type, COUNT(*) AS cnt FROM diagnostic_events GROUP BY event_type"
+                )
+            }
+        return {"total": total, "by_type": by_type}
 
     def record_observation(
         self,
@@ -157,7 +251,7 @@ class ShadowEvidenceStore:
                     COUNT(*) AS attempted,
                     SUM(CASE WHEN primary_success = 1 THEN 1 ELSE 0 END) AS primary_success,
                     SUM(CASE WHEN shadow_success = 1 THEN 1 ELSE 0 END) AS shadow_success,
-                    SUM(CASE WHEN shadow_success = 0 THEN 1 ELSE 0 END) AS shadow_failures,
+                    SUM(CASE WHEN shadow_success = 0 AND primary_success = 1 THEN 1 ELSE 0 END) AS shadow_failures,
                     AVG(latency_ms) AS avg_latency_ms
                 FROM mirrored_writes
                 """
@@ -202,7 +296,24 @@ class ShadowEvidenceStore:
                 "error_rate": (obs_rows["error_count"] or 0) / max(obs_rows["sample_count"] or 0, 1),
             },
             "namespaces": sorted(namespaces),
+            "diagnostics": self.diagnostic_summary(),
         }
+
+    def purge_synthetic(self, namespace: Optional[str] = None, run_id: Optional[str] = None) -> int:
+        """Remove synthetic mirrored writes and observations by namespace/run metadata.
+
+        Does not touch actual memory backends (Honcho/Fuli); only the evidence store.
+        """
+        with self._connect() as conn:
+            if namespace:
+                conn.execute("DELETE FROM mirrored_writes WHERE namespace = ?", (namespace,))
+                conn.execute("DELETE FROM observations WHERE namespace = ?", (namespace,))
+                conn.execute("DELETE FROM diagnostic_events WHERE namespace = ?", (namespace,))
+            else:
+                conn.execute("DELETE FROM mirrored_writes")
+                conn.execute("DELETE FROM observations")
+                conn.execute("DELETE FROM diagnostic_events")
+        return 0
 
     def purge_comparisons(self, before_timestamp: Optional[str] = None) -> int:
         with self._connect() as conn:

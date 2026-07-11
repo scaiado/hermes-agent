@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
+from pilot.primary_classifier import PrimaryResult, classify_honcho_result
 from plugins.memory import load_memory_provider
 from plugins.memory.shadow.shadow_store import ShadowEvidenceStore
 
@@ -54,7 +55,10 @@ class ShadowMemoryProvider(MemoryProvider):
         self._mirror_writes: bool = False
         self._compare_reads: bool = False
         self._sample_rate: float = 0.0
+        # Legacy single timeout (fallback), then operation-specific overrides.
         self._timeout_ms: int = 250
+        self._write_timeout_ms: int = 10000
+        self._read_timeout_ms: int = 250
         self._capture_content: bool = False
         self._namespace: str = "hermes:default"
         self._hermes_home: Optional[str] = None
@@ -83,7 +87,9 @@ class ShadowMemoryProvider(MemoryProvider):
             {"key": "mirror_writes", "description": "Mirror write operations to the secondary provider.", "required": False},
             {"key": "compare_reads", "description": "Compare read results between providers.", "required": False},
             {"key": "sample_rate", "description": "Fraction of reads to compare (0.0-1.0).", "required": False},
-            {"key": "timeout_ms", "description": "Secondary provider timeout in milliseconds.", "required": False},
+            {"key": "timeout_ms", "description": "Legacy secondary timeout in milliseconds (fallback).", "required": False},
+            {"key": "write_timeout_ms", "description": "Secondary write timeout in milliseconds (default: 10000).", "required": False},
+            {"key": "read_timeout_ms", "description": "Secondary read/search timeout in milliseconds (default: 250).", "required": False},
             {"key": "capture_content", "description": "Store full content in evidence (default false).", "required": False},
             {"key": "namespace", "description": "Namespace for shadow memories.", "required": False},
         ]
@@ -124,9 +130,20 @@ class ShadowMemoryProvider(MemoryProvider):
             self._sample_rate = 0.0
         self._sample_rate = max(0.0, min(1.0, self._sample_rate))
         try:
-            self._timeout_ms = int(shadow.get("timeout_ms", 250))
+            self._timeout_ms = int(shadow.get("timeout_ms", self._timeout_ms))
         except (TypeError, ValueError):
             self._timeout_ms = 250
+        try:
+            self._write_timeout_ms = int(shadow.get("write_timeout_ms", self._timeout_ms))
+        except (TypeError, ValueError):
+            self._write_timeout_ms = self._timeout_ms
+        try:
+            self._read_timeout_ms = int(shadow.get("read_timeout_ms", self._timeout_ms))
+        except (TypeError, ValueError):
+            self._read_timeout_ms = self._timeout_ms
+        self._timeout_ms = max(100, self._timeout_ms)
+        self._write_timeout_ms = max(100, self._write_timeout_ms)
+        self._read_timeout_ms = max(100, self._read_timeout_ms)
         self._capture_content = bool(shadow.get("capture_content", False))
         self._namespace = str(shadow.get("namespace", self._namespace))
 
@@ -138,8 +155,9 @@ class ShadowMemoryProvider(MemoryProvider):
     def _configure_secondary(self) -> None:
         """Ensure the secondary provider has a strict timeout and namespace.
 
-        Writes a provider JSON config for Fuli so its own handle_tool_call
-        respects the shadow timeout. This is done before initializing Fuli.
+        Writes a provider JSON config for Fuli with operation-specific timeouts.
+        The shadow provider's own per-call timeout args are the source of truth,
+        but this config lets Fuli internals (e.g., warm-up) default correctly.
         """
         if self._secondary_name != "fuli" or not self._hermes_home:
             return
@@ -152,7 +170,9 @@ class ShadowMemoryProvider(MemoryProvider):
             except Exception:
                 pass
         existing.setdefault("namespace", self._namespace)
-        existing.setdefault("timeout_ms", self._timeout_ms)
+        # Write operation-specific timeouts if configured; otherwise preserve existing.
+        existing.setdefault("write_timeout_ms", self._write_timeout_ms)
+        existing.setdefault("read_timeout_ms", self._read_timeout_ms)
         existing.setdefault("lazy_init", True)
         cfg_path.parent.mkdir(parents=True, exist_ok=True)
         atomic_json_write(cfg_path, existing, mode=0o600)
@@ -168,6 +188,9 @@ class ShadowMemoryProvider(MemoryProvider):
         bucket = int(hashlib.sha256(str(time.time()).encode()).hexdigest()[:8], 16) % 10000
         return bucket < int(self._sample_rate * 10000)
 
+    def _create_store(self, db_path: str) -> ShadowEvidenceStore:
+        return ShadowEvidenceStore(Path(db_path))
+
     def initialize(self, session_id: str, **kwargs) -> None:
         self._init_kwargs = dict(kwargs)
         self._hermes_home = kwargs.get("hermes_home", "")
@@ -176,7 +199,7 @@ class ShadowMemoryProvider(MemoryProvider):
             self._hermes_home = str(get_hermes_home())
 
         self._apply_config(self._load_config())
-        self._store = ShadowEvidenceStore(Path(self._hermes_home) / "memories" / "shadow.db")
+        self._store = self._create_store(str(Path(self._hermes_home) / "memories" / "shadow.db"))
 
         # Load primary. If already injected (tests), skip discovery.
         if self._primary is None:
@@ -235,9 +258,17 @@ class ShadowMemoryProvider(MemoryProvider):
         if not self._enabled or self._secondary is None:
             return primary_result
 
+        # Classify the primary result using structured status first, then decide
+        # whether mirroring is appropriate.
+        primary_class = classify_honcho_result(primary_result, latency_ms=primary_latency_ms)
+        pilot_meta = kwargs.get("pilot_meta") or {}
+        correlation_id = pilot_meta.get("correlation_id")
+
         try:
             if tool_name in WRITE_TOOLS and self._mirror_writes:
-                self._mirror_write(tool_name, args, primary_result)
+                self._mirror_write(
+                    tool_name, args, primary_class, correlation_id=correlation_id, pilot_meta=pilot_meta
+                )
             elif tool_name in READ_TOOLS and self._compare_reads and self._should_sample():
                 self._compare_read(tool_name, args, primary_result, primary_latency_ms)
         except Exception as exc:
@@ -245,32 +276,98 @@ class ShadowMemoryProvider(MemoryProvider):
 
         return primary_result
 
-    def _mirror_write(self, tool_name: str, args: Dict[str, Any], primary_result: str) -> None:
+    def _mirror_write(
+        self,
+        tool_name: str,
+        args: Dict[str, Any],
+        primary_class: PrimaryResult,
+        correlation_id: Optional[str] = None,
+        pilot_meta: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Mirror a write to Fuli only if the primary operation was confirmed successful.
+
+        Returns a structured dict describing the mirror outcome so the pilot can
+        record it in the ledger.
+        """
+        outcome: Dict[str, Any] = {
+            "mirror_attempted": False,
+            "memory_id": None,
+            "accepted": False,
+            "indexed": False,
+            "pending": False,
+            "failed": False,
+            "error_code": None,
+            "error_message": None,
+            "latency_ms": 0.0,
+        }
         if self._secondary is None:
-            return
+            return outcome
+
+        # Hard rule: only confirmed successful primary writes may become canonical
+        # Fuli memories. Failed/initializing/rejected/etc. payloads may be recorded
+        # as diagnostic events, but never as a memory.
+        if not primary_class.is_confirmed_success:
+            if self._store is not None:
+                self._store.record_diagnostic_event(
+                    namespace=self._namespace,
+                    operation=tool_name,
+                    event_type="mirror_skipped_primary_not_success",
+                    correlation_id=correlation_id,
+                    primary_status=primary_class.status.value,
+                    error_message=primary_class.error_message,
+                )
+            outcome["error_code"] = "mirror_skipped_primary_not_success"
+            outcome["error_message"] = primary_class.error_message or "primary did not succeed"
+            return outcome
+
         start = time.monotonic()
         content, metadata = self._map_to_secondary_write(tool_name, args)
         if not content:
-            return
+            return outcome
+
         shadow_success = False
         shadow_error: Optional[str] = None
+        memory_id: Optional[str] = None
+        indexed = False
+        pending = False
+        failed = False
+
         try:
             add_args = {
                 "content": content,
                 "source": tool_name,
                 "namespace": self._namespace,
+                "tags": ["shadow", "synthetic"],
             }
             if metadata:
                 add_args.update(metadata)
             if self._capture_content:
                 add_args["memory_type"] = metadata.get("memory_type", "shadow")
-            result = self._secondary.handle_tool_call("fuli_memory_add", add_args)
+            # Inject pilot metadata so Fuli can filter/correlate later.
+            pilot_payload = {"correlation_id": correlation_id}
+            if pilot_meta is not None:
+                pilot_payload.update(pilot_meta)
+            # Fuli expects metadata as a flat dict; keep correlation_id top-level too.
+            add_args["correlation_id"] = correlation_id
+            add_args["metadata"] = pilot_payload
+
+            result = self._secondary.handle_tool_call(
+                "fuli_memory_add",
+                {**add_args, "timeout_ms": self._write_timeout_ms},
+            )
             data = json.loads(result)
-            shadow_success = "memory_id" in data
+            memory_id = data.get("memory_id")
+            status = data.get("status", "accepted")
+            indexed = status == "indexed"
+            pending = status == "pending"
+            failed = status == "failed" or data.get("error") is not None
+            shadow_success = bool(memory_id) and not failed
             if not shadow_success and "error" in data:
                 shadow_error = str(data["error"])
         except Exception as exc:
             shadow_error = str(exc)
+            failed = True
+            status = "failed"
         finally:
             latency_ms = (time.monotonic() - start) * 1000.0
             if self._store is not None:
@@ -282,7 +379,22 @@ class ShadowMemoryProvider(MemoryProvider):
                     shadow_error=shadow_error,
                     latency_ms=latency_ms,
                     content_fingerprint=self._store.fingerprint(content) if content else None,
+                    correlation_id=correlation_id,
+                    fuli_memory_id=memory_id,
+                    metadata=pilot_meta,
                 )
+            outcome.update({
+                "mirror_attempted": True,
+                "memory_id": memory_id,
+                "accepted": bool(memory_id),
+                "indexed": indexed,
+                "pending": pending,
+                "failed": failed,
+                "error_code": ("fuli_" + status) if failed else None,
+                "error_message": shadow_error,
+                "latency_ms": latency_ms,
+            })
+        return outcome
 
     def _compare_read(
         self, tool_name: str, args: Dict[str, Any], primary_result: str, primary_latency_ms: float
@@ -310,7 +422,7 @@ class ShadowMemoryProvider(MemoryProvider):
             error_category = f"primary_parse_error:{exc}"
 
         try:
-            search_args = {"query": query, "top_k": 5, "namespace": self._namespace}
+            search_args = {"query": query, "top_k": 5, "namespace": self._namespace, "timeout_ms": self._read_timeout_ms}
             shadow_result = self._secondary.handle_tool_call("fuli_memory_search", search_args)
             shadow_data = json.loads(shadow_result)
             results = shadow_data.get("results", [])

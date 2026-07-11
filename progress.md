@@ -1,3 +1,47 @@
+## Shadow-pilot run — 2026-07-11T05:41:23Z
+
+- **Duration:** 6.0 hours
+- **Writes attempted:** 464
+- **Writes succeeded (Fuli):** 428
+- **Writes failed:** 36
+- **Success rate:** 92.2414%
+- **Fuli timeouts:** 0
+- **Error categories:** {}
+- **Primary errors:** 0
+- **Oldest failed write:** 2026-07-10T22:17:17Z
+- **Evidence-store rows:** 464
+- **Observation rows:** 0
+- **Namespace leak:** False
+- **Raw-content violations:** 0
+- **Fuli DB final size (bytes):** 2326528
+- **Thread alive at end:** True
+- **Loop running at end:** True
+- **Thread ever dead:** False
+- **Loop ever stopped:** False
+- **Pilot config:** {'provider': 'shadow', 'enabled': True, 'primary_provider': 'honcho', 'secondary_provider': 'fuli', 'mirror_writes': True, 'compare_reads': False, 'sample_rate': 0.0, 'timeout_ms': 250, 'capture_content': False, 'namespace': 'hermes:shadow-pilot'}
+
+## Shadow-pilot run — 2026-07-10T23:30:28Z
+
+- **Duration:** 0.1 hours
+- **Writes attempted:** 98
+- **Writes succeeded (Fuli):** 67
+- **Writes failed:** 31
+- **Success rate:** 68.3673%
+- **Fuli timeouts:** 0
+- **Error categories:** {'other': 1}
+- **Primary errors:** 1
+- **Oldest failed write:** 2026-07-10T22:17:17Z
+- **Evidence-store rows:** 98
+- **Observation rows:** 0
+- **Namespace leak:** False
+- **Raw-content violations:** 0
+- **Fuli DB final size (bytes):** 1843200
+- **Thread alive at end:** True
+- **Loop running at end:** True
+- **Thread ever dead:** False
+- **Loop ever stopped:** False
+- **Pilot config:** {'provider': 'shadow', 'enabled': True, 'primary_provider': 'honcho', 'secondary_provider': 'fuli', 'mirror_writes': True, 'compare_reads': False, 'sample_rate': 0.0, 'timeout_ms': 250, 'capture_content': False, 'namespace': 'hermes:shadow-pilot'}
+
 # Hermes ↔ Fuli Integration Progress
 
 ## Pilot launch aborted — Honcho primary unreachable
@@ -150,3 +194,21 @@ Run with `--profile shadow-pilot`.
 ## Pilot status
 
 **Aborted.** The default Hermes profile is unchanged. The dedicated `shadow-pilot` profile exists but is not active. The pilot will not be relaunched until the Honcho primary endpoint is confirmed reachable and writing successfully.
+
+
+### Overnight run (2026-07-10T23:15:39.410810+00:00)
+
+Launched the 6-hour conservative mirrored-write pilot in the `shadow-pilot` profile.
+Configuration: primary=honcho, secondary=fuli, mirror_writes=true, compare_reads=false, sample_rate=0, timeout_ms=250, namespace=hermes:shadow-pilot.
+
+**Result:** FAIL — return to Honcho-only and investigate
+
+**Metrics:**
+- Primary attempts: 98, succeeded: 67, failed: 31, success rate: 68.37%
+- Fuli timeouts: 0, indexed: 85, pending: 8, indexing rate: 91.40%
+- Memory: 539.33 MB → 20.47 MB
+- Fuli DB: 1.76 MB → 2.18 MB
+- Evidence rows: 0 → 0
+- Namespace leak: False, raw content violations: False
+
+Reports saved in `~/.hermes/profiles/shadow-pilot/shadow/`.

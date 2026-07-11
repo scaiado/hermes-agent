@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 ADD_SCHEMA = {
     "name": "fuli_memory_add",
     "description": (
-        "Store a new memory in Fuli. Returns the memory id. "
+        "Store a new memory in Fuli. Returns the memory id and status. "
         "Use source='user' for things the user said, 'agent' for things you learned, "
         "or 'observation' for background facts."
     ),
@@ -61,6 +61,7 @@ ADD_SCHEMA = {
             "importance": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.5},
             "confidence": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.5},
             "memory_type": {"type": "string"},
+            "correlation_id": {"type": "string"},
         },
         "required": ["content"],
     },
@@ -128,7 +129,31 @@ DIAGNOSTICS_SCHEMA = {
     "parameters": {"type": "object", "properties": {}, "required": []},
 }
 
-ALL_SCHEMAS = [ADD_SCHEMA, SEARCH_SCHEMA, GET_SCHEMA, DELETE_SCHEMA, REINFORCE_SCHEMA, DIAGNOSTICS_SCHEMA]
+BATCH_STATUS_SCHEMA = {
+    "name": "fuli_memory_batch_status",
+    "description": "Return structured status for a batch of Fuli memory IDs.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "memory_ids": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["memory_ids"],
+    },
+}
+
+STORAGE_HEALTH_SCHEMA = {
+    "name": "fuli_memory_storage_health",
+    "description": "Return a SQLite storage health check report (journal mode, WAL size, integrity checks).",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "deep": {"type": "boolean", "default": False},
+        },
+        "required": [],
+    },
+}
+
+ALL_SCHEMAS = [ADD_SCHEMA, SEARCH_SCHEMA, GET_SCHEMA, DELETE_SCHEMA, REINFORCE_SCHEMA, DIAGNOSTICS_SCHEMA, BATCH_STATUS_SCHEMA, STORAGE_HEALTH_SCHEMA]
 
 
 # ---------------------------------------------------------------------------
@@ -315,12 +340,42 @@ class FuliMemoryProvider(MemoryProvider):
         self._embedding_model = str(config.get("embedding_model") or self._embedding_model)
         self._device = str(config.get("device") or self._device)
         self._lazy_init = bool(config.get("lazy_init", True))
+        # Legacy single timeout (fallback), then operation-specific overrides.
         try:
-            self._timeout_ms = int(config.get("timeout_ms", 5000))
+            base_timeout = int(config.get("timeout_ms", 5000))
         except (TypeError, ValueError):
-            self._timeout_ms = 5000
-        if self._timeout_ms < 100:
-            self._timeout_ms = 100
+            base_timeout = 5000
+        try:
+            self._write_timeout_ms = int(config.get("write_timeout_ms", base_timeout))
+        except (TypeError, ValueError):
+            self._write_timeout_ms = base_timeout
+        try:
+            self._read_timeout_ms = int(config.get("read_timeout_ms", base_timeout))
+        except (TypeError, ValueError):
+            self._read_timeout_ms = base_timeout
+        for attr in ("_write_timeout_ms", "_read_timeout_ms"):
+            val = getattr(self, attr)
+            if val < 100:
+                setattr(self, attr, 100)
+
+    def _timeout_for(self, tool_name: str, args: Dict[str, Any]) -> float:
+        """Return the operation timeout in seconds for a given Fuli tool call.
+
+        Order of precedence:
+        1. Per-call ``timeout_ms`` override in args.
+        2. Operation-specific config: write_timeout_ms for writes, read_timeout_ms for reads.
+        3. Legacy timeout_ms if it was the only config present.
+        """
+        if "timeout_ms" in args:
+            try:
+                ms = int(args["timeout_ms"])
+                if ms >= 100:
+                    return ms / 1000.0
+            except (TypeError, ValueError):
+                pass
+        if tool_name in {"fuli_memory_add", "fuli_memory_delete", "fuli_memory_reinforce"}:
+            return self._write_timeout_ms / 1000.0
+        return self._read_timeout_ms / 1000.0
 
     def _resolve_db_path(self, hermes_home: str, config: Dict[str, Any]) -> str:
         db_path = config.get("db_path")
@@ -403,13 +458,38 @@ class FuliMemoryProvider(MemoryProvider):
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return list(ALL_SCHEMAS)
 
+    def batch_status(self, memory_ids: List[str]) -> Dict[str, str]:
+        """Synchronous convenience wrapper used by the shadow pilot drain."""
+        raw = self.handle_tool_call("fuli_memory_batch_status", {"memory_ids": memory_ids})
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return {mid: "pending" for mid in memory_ids}
+        statuses = data.get("statuses", {})
+        out: Dict[str, str] = {}
+        for mid, value in statuses.items():
+            if isinstance(value, dict):
+                indexing = str(value.get("indexing_status") or "").lower()
+                status = str(value.get("status") or "").lower()
+                if indexing == "indexed":
+                    out[mid] = "indexed"
+                elif indexing == "failed" or status == "failed":
+                    out[mid] = "failed"
+                else:
+                    out[mid] = "pending"
+            elif isinstance(value, str):
+                out[mid] = value.lower()
+            else:
+                out[mid] = "pending"
+        return out
+
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         if not self._ensure_provider():
             err = self._init_error or "Fuli provider is not initialized"
             return json.dumps({"error": err})
 
         try:
-            timeout = self._timeout_ms / 1000.0
+            timeout = self._timeout_for(tool_name, args)
             if tool_name == "fuli_memory_add":
                 return self._bridge.run(self._add(args), timeout=timeout)
             if tool_name == "fuli_memory_search":
@@ -422,6 +502,10 @@ class FuliMemoryProvider(MemoryProvider):
                 return self._bridge.run(self._reinforce(args), timeout=timeout)
             if tool_name == "fuli_memory_diagnostics":
                 return self._bridge.run(self._diagnostics(), timeout=timeout)
+            if tool_name == "fuli_memory_batch_status":
+                return self._bridge.run(self._batch_status(args.get("memory_ids", [])), timeout=timeout)
+            if tool_name == "fuli_memory_storage_health":
+                return self._bridge.run(self._storage_health(args.get("deep", False)), timeout=timeout)
         except concurrent.futures.TimeoutError as exc:
             logger.warning("Fuli tool %s timed out: %s", tool_name, exc)
             return json.dumps({"error": f"Fuli call timed out: {exc}"})
@@ -437,6 +521,7 @@ class FuliMemoryProvider(MemoryProvider):
         content = args["content"]
         source = args.get("source", "unknown")
         namespace = args.get("namespace", self._namespace)
+        correlation_id = args.get("correlation_id")
         metadata: Dict[str, Any] = {}
         if "tags" in args:
             metadata["tags"] = args["tags"]
@@ -446,8 +531,27 @@ class FuliMemoryProvider(MemoryProvider):
             metadata["confidence"] = args["confidence"]
         if "memory_type" in args:
             metadata["memory_type"] = args["memory_type"]
-        memory_id = await self._provider.add(content, source=source, namespace=namespace, **metadata)
+
+        # Prefer the P0 structured method when available; fall back to legacy add().
+        if hasattr(self._provider, "add_with_status"):
+            result = await self._provider.add_with_status(
+                content, source=source, namespace=namespace, correlation_id=correlation_id, **metadata
+            )
+            return json.dumps({
+                "memory_id": result.memory_id,
+                "event_id": getattr(result, "event_id", None),
+                "created": getattr(result, "created", True),
+                "status": self._indexing_status_name(result.indexing_status),
+                "indexing_error": getattr(result, "indexing_error", None),
+                "correlation_id": getattr(result, "correlation_id", None),
+            })
+
+        memory_id = await self._provider.add(content, source=source, namespace=namespace, correlation_id=correlation_id, **metadata)
         return json.dumps({"memory_id": memory_id})
+
+    @staticmethod
+    def _indexing_status_name(status: Any) -> str:
+        return status.value if hasattr(status, "value") else str(status)
 
     async def _search(self, args: Dict[str, Any]) -> str:
         from fuli.models import RetrievalMode, SearchFilters
@@ -526,6 +630,33 @@ class FuliMemoryProvider(MemoryProvider):
             "namespaces": report.namespaces,
             "lifecycle_distribution": report.lifecycle_distribution,
         })
+
+    async def _batch_status(self, memory_ids: List[str]) -> str:
+        if not hasattr(self._provider, "batch_status"):
+            return json.dumps({"error": "batch_status not supported by this provider"})
+        result = await self._provider.batch_status(memory_ids=memory_ids)
+        out: Dict[str, Any] = {}
+        for mid, value in result.items():
+            if value is None:
+                out[mid] = None
+            elif hasattr(value, "memory_id"):
+                out[mid] = {
+                    "memory_id": value.memory_id,
+                    "event_id": getattr(value, "event_id", None),
+                    "created": getattr(value, "created", True),
+                    "status": self._indexing_status_name(getattr(value, "status", None)),
+                    "indexing_status": self._indexing_status_name(getattr(value, "indexing_status", None)),
+                    "indexing_error": getattr(value, "indexing_error", None),
+                    "correlation_id": getattr(value, "correlation_id", None),
+                    "duplicate_of": getattr(value, "duplicate_of", None),
+                }
+            else:
+                out[mid] = str(value)
+        return json.dumps({"statuses": out})
+
+    async def _storage_health(self, deep: bool = False) -> str:
+        report = await self._provider.run_storage_health_check(include_integrity=deep)
+        return report.model_dump_json()
 
     # -- Lifecycle hooks ------------------------------------------------------
 

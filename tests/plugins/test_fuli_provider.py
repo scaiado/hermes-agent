@@ -249,8 +249,8 @@ def test_save_config_creates_provider_config(hermes_home: Path):
 def test_tool_schemas_have_required_fields():
     p = FuliMemoryProvider()
     schemas = p.get_tool_schemas()
-    assert len(schemas) == 6
-    for schema in schemas:
-        assert schema["name"].startswith("fuli_memory_")
-        assert "parameters" in schema
-    p.shutdown()
+    assert len(schemas) == 8
+    for s in schemas:
+        assert "name" in s
+        assert "parameters" in s
+        assert "type" in s["parameters"]

@@ -55,7 +55,7 @@
 - [x] Add dynamic primary probe to the pilot script
 - [x] Confirm Honcho primary endpoint `http://100.77.121.91:8000` is reachable and writes successfully
 - [x] Re-run `hermes shadow preflight` and primary probe after endpoint is restored
-- [ ] Launch the 4–8 hour conservative mirrored-write pilot
-- [ ] Collect exact evidence and update `progress.md` / `TODO.txt`
+- [x] Launch the 6-hour conservative mirrored-write pilot
+- [x] Collect exact evidence and update `progress.md` / `TODO.txt`
 - [ ] Do not activate normal user profile
 - [ ] Do not enable `compare_reads` until the pilot report is reviewed
