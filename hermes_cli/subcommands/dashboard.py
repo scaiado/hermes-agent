@@ -43,9 +43,16 @@ def _add_server_runtime_args(parser) -> None:
         "--skip-build",
         action="store_true",
         help=(
-            "Skip the web UI build step and serve the existing dist directly. "
-            "Useful for non-interactive contexts (Windows Scheduled Tasks, CI) "
-            "where npm may not be available. Pre-build with: cd web && npm run build"
+            "Deprecated: no-op. A pre-built web dist is now used automatically "
+            "when present. Use --rebuild to force a fresh npm build."
+        ),
+    )
+    parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help=(
+            "Force a fresh web UI build even if a pre-built dist already exists. "
+            "Requires npm/Node."
         ),
     )
     parser.add_argument(

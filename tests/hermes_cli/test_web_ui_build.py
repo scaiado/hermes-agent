@@ -35,26 +35,26 @@ def _make_web_dir(tmp_path: Path) -> tuple[Path, Path]:
 class TestWebUIBuildNeeded:
 
     def test_returns_true_when_dist_missing(self, tmp_path):
-        web_dir, _ = _make_web_dir(tmp_path)
-        assert _web_ui_build_needed(web_dir) is True
+        web_dir, dist_dir = _make_web_dir(tmp_path)
+        assert _web_ui_build_needed(web_dir, dist_dir=dist_dir) is True
 
     def test_returns_false_when_vite_manifest_fresh(self, tmp_path):
         web_dir, dist_dir = _make_web_dir(tmp_path)
         _touch(web_dir / "src" / "App.tsx", offset=-10)
         _touch(dist_dir / ".vite" / "manifest.json")
-        assert _web_ui_build_needed(web_dir) is False
+        assert _web_ui_build_needed(web_dir, dist_dir=dist_dir) is False
 
     def test_returns_true_when_source_newer_than_manifest(self, tmp_path):
         web_dir, dist_dir = _make_web_dir(tmp_path)
         _touch(dist_dir / ".vite" / "manifest.json", offset=-10)
         _touch(web_dir / "src" / "App.tsx")
-        assert _web_ui_build_needed(web_dir) is True
+        assert _web_ui_build_needed(web_dir, dist_dir=dist_dir) is True
 
     def test_falls_back_to_index_html_when_manifest_missing(self, tmp_path):
         web_dir, dist_dir = _make_web_dir(tmp_path)
         _touch(web_dir / "src" / "main.ts", offset=-10)
         _touch(dist_dir / "index.html")
-        assert _web_ui_build_needed(web_dir) is False
+        assert _web_ui_build_needed(web_dir, dist_dir=dist_dir) is False
 
     def test_web_dist_dir_not_web_dist_subdir(self, tmp_path):
         """Regression: sentinel must be in hermes_cli/web_dist/, NOT web/dist/."""
@@ -64,7 +64,7 @@ class TestWebUIBuildNeeded:
         wrong_dist = web_dir / "dist" / ".vite" / "manifest.json"
         _touch(wrong_dist)
         # Correct location is empty → still needs build
-        assert _web_ui_build_needed(web_dir) is True
+        assert _web_ui_build_needed(web_dir, dist_dir=dist_dir) is True
 
     def test_returns_true_when_package_lock_newer_than_dist(self, tmp_path):
         web_dir, dist_dir = _make_web_dir(tmp_path)
@@ -72,13 +72,13 @@ class TestWebUIBuildNeeded:
         # With a single workspace root lockfile, the lockfile lives at the
         # project root (tmp_path), not inside web_dir.
         _touch(tmp_path / "package-lock.json")
-        assert _web_ui_build_needed(web_dir) is True
+        assert _web_ui_build_needed(web_dir, dist_dir=dist_dir) is True
 
     def test_returns_true_when_vite_config_newer_than_dist(self, tmp_path):
         web_dir, dist_dir = _make_web_dir(tmp_path)
         _touch(dist_dir / ".vite" / "manifest.json", offset=-10)
         _touch(web_dir / "vite.config.ts")
-        assert _web_ui_build_needed(web_dir) is True
+        assert _web_ui_build_needed(web_dir, dist_dir=dist_dir) is True
 
     def test_ignores_node_modules(self, tmp_path):
         web_dir, dist_dir = _make_web_dir(tmp_path)
@@ -86,7 +86,7 @@ class TestWebUIBuildNeeded:
         _touch(web_dir / "package.json", offset=-20)
         _touch(dist_dir / ".vite" / "manifest.json", offset=-10)
         _touch(web_dir / "node_modules" / "react" / "index.js")
-        assert _web_ui_build_needed(web_dir) is False
+        assert _web_ui_build_needed(web_dir, dist_dir=dist_dir) is False
 
     def test_ignores_dist_subdir_under_web(self, tmp_path):
         web_dir, dist_dir = _make_web_dir(tmp_path)
@@ -94,7 +94,7 @@ class TestWebUIBuildNeeded:
         _touch(web_dir / "package.json", offset=-20)
         _touch(dist_dir / ".vite" / "manifest.json", offset=-10)
         _touch(web_dir / "dist" / "assets" / "index.js")
-        assert _web_ui_build_needed(web_dir) is False
+        assert _web_ui_build_needed(web_dir, dist_dir=dist_dir) is False
 
 
 class TestBuildWebUISkipsWhenFresh:
@@ -105,20 +105,20 @@ class TestBuildWebUISkipsWhenFresh:
 
         with patch("hermes_cli.main.shutil.which", return_value="/usr/bin/npm"), \
              patch("hermes_cli.main.subprocess.run") as mock_run:
-            result = _build_web_ui(web_dir)
+            result = _build_web_ui(web_dir, dist_dir=dist_dir)
 
         assert result is True
         mock_run.assert_not_called()
 
     def test_runs_npm_when_dist_missing(self, tmp_path):
-        web_dir, _ = _make_web_dir(tmp_path)
+        web_dir, dist_dir = _make_web_dir(tmp_path)
 
         mock_cp = __import__("subprocess").CompletedProcess([], 0, stdout=b"", stderr=b"")
         build_ok = __import__("subprocess").CompletedProcess([], 0, stdout="", stderr="")
         with patch("hermes_cli.main.shutil.which", return_value="/usr/bin/npm"), \
              patch("hermes_cli.main.subprocess.run", return_value=mock_cp) as mock_run, \
              patch("hermes_cli.main._run_with_idle_timeout", return_value=build_ok) as mock_idle:
-            result = _build_web_ui(web_dir)
+            result = _build_web_ui(web_dir, dist_dir=dist_dir)
 
         assert result is True
         # npm install goes through subprocess.run; npm run build goes through
@@ -127,7 +127,7 @@ class TestBuildWebUISkipsWhenFresh:
         assert mock_idle.call_count == 1  # build only
 
     def test_npm_install_uses_utf8_replace_output_decoding(self, tmp_path):
-        web_dir, _ = _make_web_dir(tmp_path)
+        web_dir, dist_dir = _make_web_dir(tmp_path)
         (web_dir / "package-lock.json").write_text("{}", encoding="utf-8")
 
         mock_cp = __import__("subprocess").CompletedProcess([], 0, stdout="", stderr="")
@@ -141,7 +141,7 @@ class TestBuildWebUISkipsWhenFresh:
         assert kwargs["errors"] == "replace"
 
     def test_npm_install_sets_ci_to_suppress_postinstall_tty_output(self, tmp_path):
-        web_dir, _ = _make_web_dir(tmp_path)
+        web_dir, dist_dir = _make_web_dir(tmp_path)
         (web_dir / "package-lock.json").write_text("{}", encoding="utf-8")
 
         mock_cp = __import__("subprocess").CompletedProcess([], 0, stdout="", stderr="")
@@ -157,7 +157,7 @@ class TestBuildWebUISkipsWhenFresh:
         assert kwargs["env"]["PYTHON"] == "/nix/store/python"
 
     def test_npm_install_uses_workspace_web_scope(self, tmp_path):
-        web_dir, _ = _make_web_dir(tmp_path)
+        web_dir, dist_dir = _make_web_dir(tmp_path)
         # Real workspace checkout: the single lockfile lives at the root, so
         # _workspace_root(web_dir) resolves to the parent and --workspace web
         # scopes the install. (Without a root lockfile, web_dir IS the root and
@@ -168,7 +168,7 @@ class TestBuildWebUISkipsWhenFresh:
         with patch("hermes_cli.main.shutil.which", return_value="/usr/bin/npm"), \
              patch("hermes_cli.main.subprocess.run", return_value=mock_cp) as mock_run, \
              patch("hermes_cli.main._run_with_idle_timeout", return_value=build_ok):
-            result = _build_web_ui(web_dir)
+            result = _build_web_ui(web_dir, dist_dir=dist_dir)
         assert result is True
         install_cmd = mock_run.call_args[0][0]
         assert "--workspace" in install_cmd
@@ -185,7 +185,7 @@ class TestBuildWebUISkipsWhenFresh:
         With web's own lockfile present at cwd, _run_npm_install_deterministic
         uses ``npm ci`` (not ``npm install``).
         """
-        web_dir, _ = _make_web_dir(tmp_path)
+        web_dir, dist_dir = _make_web_dir(tmp_path)
         (web_dir / "package-lock.json").write_text("{}", encoding="utf-8")
         (tmp_path / "package-lock.json").write_text("{}", encoding="utf-8")
         monkeypatch.delenv("TERMUX_VERSION", raising=False)
@@ -196,7 +196,7 @@ class TestBuildWebUISkipsWhenFresh:
         with patch("hermes_cli.main.shutil.which", return_value="/usr/bin/npm"), \
              patch("hermes_cli.main.subprocess.run", return_value=install_cp) as mock_run, \
              patch("hermes_cli.main._run_with_idle_timeout", return_value=build_cp):
-            result = _build_web_ui(web_dir)
+            result = _build_web_ui(web_dir, dist_dir=dist_dir)
 
         assert result is True
         args, kwargs = mock_run.call_args
@@ -211,14 +211,14 @@ class TestBuildWebUISkipsWhenFresh:
         retry-on-EPERM contract depends on it); only the long-running build
         step is streamed + idle-killed.
         """
-        web_dir, _ = _make_web_dir(tmp_path)
+        web_dir, dist_dir = _make_web_dir(tmp_path)
 
         install_cp = __import__("subprocess").CompletedProcess([], 0, stdout="", stderr="")
         build_cp = __import__("subprocess").CompletedProcess([], 0, stdout="", stderr="")
         with patch("hermes_cli.main.shutil.which", return_value="/usr/bin/npm"), \
              patch("hermes_cli.main.subprocess.run", return_value=install_cp), \
              patch("hermes_cli.main._run_with_idle_timeout", return_value=build_cp) as mock_idle:
-            result = _build_web_ui(web_dir)
+            result = _build_web_ui(web_dir, dist_dir=dist_dir)
 
         assert result is True
         # Build was invoked through the idle-timeout helper, not subprocess.run.
@@ -229,7 +229,7 @@ class TestBuildWebUISkipsWhenFresh:
         assert kwargs["cwd"] == web_dir
 
     def test_termux_web_install_is_workspace_scoped(self, tmp_path, monkeypatch):
-        web_dir, _ = _make_web_dir(tmp_path)
+        web_dir, dist_dir = _make_web_dir(tmp_path)
         (tmp_path / "package-lock.json").write_text("{}", encoding="utf-8")
         monkeypatch.setenv("TERMUX_VERSION", "1")
 
@@ -238,7 +238,7 @@ class TestBuildWebUISkipsWhenFresh:
         with patch("hermes_cli.main.shutil.which", return_value="/usr/bin/npm"), \
              patch("hermes_cli.main.subprocess.run", return_value=install_cp) as mock_run, \
              patch("hermes_cli.main._run_with_idle_timeout", return_value=build_cp):
-            result = _build_web_ui(web_dir)
+            result = _build_web_ui(web_dir, dist_dir=dist_dir)
 
         assert result is True
         args, kwargs = mock_run.call_args
@@ -255,7 +255,7 @@ class TestBuildWebUISkipsWhenFresh:
     def test_desktop_web_install_uses_existing_workspace_root(
         self, tmp_path, monkeypatch
     ):
-        web_dir, _ = _make_web_dir(tmp_path)
+        web_dir, dist_dir = _make_web_dir(tmp_path)
         (tmp_path / "package-lock.json").write_text("{}", encoding="utf-8")
         monkeypatch.delenv("TERMUX_VERSION", raising=False)
         monkeypatch.setenv("PREFIX", "/usr")
@@ -265,7 +265,7 @@ class TestBuildWebUISkipsWhenFresh:
         with patch("hermes_cli.main.shutil.which", return_value="/usr/bin/npm"), \
              patch("hermes_cli.main.subprocess.run", return_value=install_cp) as mock_run, \
              patch("hermes_cli.main._run_with_idle_timeout", return_value=build_cp):
-            result = _build_web_ui(web_dir)
+            result = _build_web_ui(web_dir, dist_dir=dist_dir)
 
         assert result is True
         args, kwargs = mock_run.call_args
@@ -277,7 +277,7 @@ class TestBuildWebUIRetryAndStaleFallback:
     """Coverage for the retry + stale-dist fallback added in #23824 / issue #23817."""
 
     def test_retries_build_once_on_failure(self, tmp_path):
-        web_dir, _ = _make_web_dir(tmp_path)
+        web_dir, dist_dir = _make_web_dir(tmp_path)
         Subprocess = __import__("subprocess")
         install_ok = Subprocess.CompletedProcess([], 0, stdout="", stderr="")
         # build attempt 1: fail; build attempt 2: success.
@@ -288,7 +288,7 @@ class TestBuildWebUIRetryAndStaleFallback:
              patch("hermes_cli.main.subprocess.run", return_value=install_ok), \
              patch("hermes_cli.main._run_with_idle_timeout",
                    side_effect=[build_fail, build_ok]) as mock_idle:
-            result = _build_web_ui(web_dir)
+            result = _build_web_ui(web_dir, dist_dir=dist_dir)
 
         assert result is True
         assert mock_idle.call_count == 2  # build + retry
@@ -308,7 +308,7 @@ class TestBuildWebUIRetryAndStaleFallback:
              patch("hermes_cli.main.subprocess.run", return_value=install_ok), \
              patch("hermes_cli.main._run_with_idle_timeout",
                    side_effect=[build_fail, build_fail]):
-            result = _build_web_ui(web_dir, fatal=True)
+            result = _build_web_ui(web_dir, fatal=True, dist_dir=dist_dir)
 
         # MUST return True (serve stale) — issue #23817 — even with fatal=True,
         # because cmd_dashboard passes fatal=True and is the primary caller.
@@ -318,7 +318,7 @@ class TestBuildWebUIRetryAndStaleFallback:
         assert "vite ENOMEM" in out  # combined output surfaced to user
 
     def test_hard_fails_when_no_dist_to_fall_back_to(self, tmp_path, capsys):
-        web_dir, _ = _make_web_dir(tmp_path)
+        web_dir, dist_dir = _make_web_dir(tmp_path)
 
         Subprocess = __import__("subprocess")
         install_ok = Subprocess.CompletedProcess([], 0, stdout="", stderr="")
@@ -328,7 +328,7 @@ class TestBuildWebUIRetryAndStaleFallback:
              patch("hermes_cli.main.subprocess.run", return_value=install_ok), \
              patch("hermes_cli.main._run_with_idle_timeout",
                    side_effect=[build_fail, build_fail]):
-            result = _build_web_ui(web_dir, fatal=True)
+            result = _build_web_ui(web_dir, fatal=True, dist_dir=dist_dir)
 
         assert result is False
         out = capsys.readouterr().out

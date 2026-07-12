@@ -4620,19 +4620,22 @@ def _gateway_prompt(prompt_text: str, default: str = "", timeout: float = 300.0)
     return default
 
 
-def _web_ui_build_needed(web_dir: Path) -> bool:
+def _web_ui_build_needed(web_dir: Path, dist_dir: Path | None = None) -> bool:
     """Return True if the web UI dist is missing or stale.
 
     Mirrors the staleness logic used by ``_tui_build_needed()`` for the TUI.
     The dashboard source lives under ``web/``, but the Vite build
-    still outputs to ``hermes_cli/web_dist/`` (per vite.config.ts
+    outputs to ``hermes_cli/web_dist/`` (per vite.config.ts
     outDir: "../hermes_cli/web_dist"), NOT to ``web/dist/``, so Python
     packaging can continue serving the same static asset directory. Uses the
     Vite manifest as the sentinel because it is written last and therefore
     has the newest mtime of any build output.
+
+    Paths are resolved against ``PROJECT_ROOT`` so the check is correct
+    regardless of the current working directory.
     """
-    project_root = web_dir.parent.parent if web_dir.parent.name == "apps" else web_dir.parent
-    dist_dir = project_root / "hermes_cli" / "web_dist"
+    if dist_dir is None:
+        dist_dir = PROJECT_ROOT / "hermes_cli" / "web_dist"
     sentinel = dist_dir / ".vite" / "manifest.json"
     if not sentinel.exists():
         sentinel = dist_dir / "index.html"
@@ -4657,10 +4660,20 @@ def _web_ui_build_needed(web_dir: Path) -> bool:
         if mp.exists() and mp.stat().st_mtime > dist_mtime:
             return True
     # Workspace root lockfile (single package-lock.json covers all workspaces).
-    root_lock = project_root / "package-lock.json"
+    root_lock = PROJECT_ROOT / "package-lock.json"
     if root_lock.exists() and root_lock.stat().st_mtime > dist_mtime:
         return True
     return False
+
+
+def _dashboard_web_dist_dir() -> Path:
+    """Return the package-relative path to the built web UI dist.
+
+    This is the directory that ``vite.config.ts`` writes into, and it is
+    independent of the current working directory. It is also the directory
+    served by ``web_server.WEB_DIST`` when ``HERMES_WEB_DIST`` is not set.
+    """
+    return PROJECT_ROOT / "hermes_cli" / "web_dist"
 
 
 def _run_with_idle_timeout(
@@ -4868,20 +4881,24 @@ def _run_npm_install_deterministic(
     )
 
 
-def _build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
+def _build_web_ui(web_dir: Path, *, fatal: bool = False, dist_dir: Path | None = None) -> bool:
     """Build the web UI frontend if npm is available.
 
     Args:
         web_dir: Path to the dashboard frontend source directory.
         fatal: If True, print error guidance and return False on failure
                instead of a soft warning (used by ``hermes web``).
+        dist_dir: Output directory for the built dist. Defaults to the
+            package-relative ``hermes_cli/web_dist``.
 
     Returns True if the build succeeded or was skipped (no package.json).
     """
+    if dist_dir is None:
+        dist_dir = PROJECT_ROOT / "hermes_cli" / "web_dist"
     if not (web_dir / "package.json").exists():
         return True
 
-    if not _web_ui_build_needed(web_dir):
+    if not _web_ui_build_needed(web_dir, dist_dir=dist_dir):
         return True
 
     # Console-encoding-safe print: Windows consoles default to cp1252
@@ -4968,8 +4985,6 @@ def _build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
         build_output = (r2.stderr or "") + (r2.stdout or "")
         stderr_preview = build_output.strip()
         stderr_tail = "\n  ".join(stderr_preview.splitlines()[-10:]) if stderr_preview else ""
-        project_root = web_dir.parent.parent if web_dir.parent.name == "apps" else web_dir.parent
-        dist_dir = project_root / "hermes_cli" / "web_dist"
         dist_index = dist_dir / "index.html"
 
         # If a stale dist exists, serve it as a fallback instead of failing.
@@ -12120,41 +12135,38 @@ def cmd_dashboard(args):
         # Don't build the SPA, and tell mount_spa() (read at web_server import
         # below) to disable it even if a stray dist exists. Set it first.
         os.environ["HERMES_SERVE_HEADLESS"] = "1"
-    elif "HERMES_WEB_DIST" not in os.environ and not getattr(args, "skip_build", False):
-        if not _build_web_ui(PROJECT_ROOT / "web", fatal=True):
-            sys.exit(1)
-    elif getattr(args, "skip_build", False):
-        # --build-mode skip trusts the caller to have pre-built the web UI.
-        # Verify the dist actually exists; otherwise the server will start
-        # and serve 404s with no obvious cause (issue #23817).
-        _dist_root = (
-            Path(os.environ["HERMES_WEB_DIST"])
-            if "HERMES_WEB_DIST" in os.environ
-            else PROJECT_ROOT / "hermes_cli" / "web_dist"
-        )
-        if not (_dist_root / "index.html").exists():
-            print(f"✗ --skip-build was passed but no web dist found at: {_dist_root}")
-            print("  Pre-build first:  npm install --workspace web && npm run build -w web")
-            print("  Or drop --skip-build to build automatically.")
-            sys.exit(1)
-        print(f"→ Skipping web UI build (--skip-build); using dist at {_dist_root}")
-    else:
-        # HERMES_WEB_DIST is set without --skip-build: the build is skipped
-        # (the env var points at a caller-managed dist), so validate it the
-        # same way the --skip-build branch does — otherwise the server starts
-        # and serves 404s with no obvious cause (same failure mode as #23817,
-        # via the env-var path).
+    elif "HERMES_WEB_DIST" in os.environ:
+        # HERMES_WEB_DIST is set without --rebuild: the caller owns the dist.
+        # Validate it exists so the server doesn't start and serve 404s.
         _dist_root = Path(os.environ["HERMES_WEB_DIST"]).expanduser()
         if not (_dist_root / "index.html").exists():
             print(f"✗ HERMES_WEB_DIST is set but no web dist found at: {_dist_root}")
             print("  Pre-build first:  npm install --workspace web && npm run build -w web")
-            print("  Or unset HERMES_WEB_DIST to build and use the default web UI dist.")
+            print("  Or unset HERMES_WEB_DIST to use the default web UI dist.")
             sys.exit(1)
         # Write the expanded path back: web_server reads HERMES_WEB_DIST raw
         # at import (no expanduser), so a validated "~/dist" would otherwise
         # pass here and still 404 there.
         os.environ["HERMES_WEB_DIST"] = str(_dist_root)
         print(f"→ Using web dist from HERMES_WEB_DIST: {_dist_root}")
+    elif getattr(args, "rebuild", False):
+        # Explicit rebuild: require npm and rebuild regardless of existing dist.
+        if not _build_web_ui(PROJECT_ROOT / "web", fatal=True, dist_dir=_dashboard_web_dist_dir()):
+            sys.exit(1)
+    else:
+        # Default: serve a pre-built package-relative dist if available. This
+        # makes the dashboard start under launchd/systemd/supervisors with no
+        # npm, Node, or repository-root cwd requirement.
+        _dist_root = _dashboard_web_dist_dir()
+        if (_dist_root / "index.html").exists():
+            print(f"→ Using pre-built web dist: {_dist_root}")
+        else:
+            # No dist yet; try to build once. Fall back to the fatal error if
+            # npm is unavailable so the operator knows what to install.
+            if not _build_web_ui(PROJECT_ROOT / "web", fatal=True, dist_dir=_dist_root):
+                sys.exit(1)
+        # Ensure web_server sees the absolute dist path (no cwd dependency).
+        os.environ["HERMES_WEB_DIST"] = str(_dist_root)
 
     # Discover and load plugins so any DashboardAuthProvider plugin
     # (e.g. plugins/dashboard_auth/nous) registers BEFORE start_server's
