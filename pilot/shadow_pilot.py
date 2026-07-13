@@ -68,6 +68,16 @@ class PilotConfig:
     run_id: str = field(default_factory=lambda: f"{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}")
     hermes_home: Path = field(default=HERMES_HOME)
     profile_name: str = PROFILE_NAME
+    # Primary health gate thresholds (added for the 2026-07-13 false-green fix).
+    # Defaults match the four-hour P0 soak; the 15-minute qualification uses
+    # looser values via config overrides.
+    primary_success_rate_required_percent: float = 99.9
+    minimum_primary_success_required: int = 200
+    primary_p95_max_ms: float = 10_000.0
+    primary_timeout_rate_max_percent: float = 0.1
+    # Sustained-outage detection: if the primary fails this many attempts in a
+    # row, the run is classified as invalid_primary_unavailable.
+    sustained_primary_outage_threshold: int = 30
 
 
 class PilotState:
@@ -89,6 +99,16 @@ class PilotState:
         self.final_rss_bytes: Optional[int] = None
         self.storage_health: Optional[Dict[str, Any]] = None
         self.fuli_commit: Optional[str] = None
+        # Primary health observability.
+        self.primary_available_at_start: Optional[bool] = None
+        self.primary_available_at_end: Optional[bool] = None
+        self.consecutive_primary_failures: int = 0
+        self.max_consecutive_primary_failures: int = 0
+        self.primary_writes_above_p95_threshold: int = 0
+        # RSS sampling (after warm-up).
+        self.rss_samples: List[Tuple[float, int]] = []  # (monotonic_seconds, rss_bytes)
+        self.warmup_rss_bytes: Optional[int] = None
+        self.rss_sampling_started: bool = False
 
     def remaining_seconds(self) -> float:
         return max(0.0, self.end_time - time.monotonic())
@@ -226,12 +246,16 @@ def _do_one_write(
 
     start = time.monotonic()
     primary_raw: str
+    primary_succeeded = False
     try:
         primary_raw = provider.handle_tool_call(tool_name, args, pilot_meta=pilot_meta)
     except Exception as exc:
         primary_raw = ""
         ledger.record_primary_result(correlation_id, classify_exception(exc))
         _log_primary_error(state, sequence, exc)
+        state.consecutive_primary_failures += 1
+        if state.consecutive_primary_failures > state.max_consecutive_primary_failures:
+            state.max_consecutive_primary_failures = state.consecutive_primary_failures
         return
 
     latency_ms = (time.monotonic() - start) * 1000.0
@@ -240,7 +264,18 @@ def _do_one_write(
 
     if not primary_class.is_confirmed_success:
         _log_primary_error(state, sequence, primary_class.error_message or primary_class.status.value)
+        state.consecutive_primary_failures += 1
+        if state.consecutive_primary_failures > state.max_consecutive_primary_failures:
+            state.max_consecutive_primary_failures = state.consecutive_primary_failures
+        if latency_ms > state.config.primary_p95_max_ms:
+            state.primary_writes_above_p95_threshold += 1
         return
+
+    # Primary confirmed success: reset consecutive-failure counter.
+    primary_succeeded = True
+    state.consecutive_primary_failures = 0
+    if latency_ms > state.config.primary_p95_max_ms:
+        state.primary_writes_above_p95_threshold += 1
 
     # Read the mirror outcome from the evidence store. The shadow provider
     # records the mirror outcome with the same correlation_id.
@@ -516,10 +551,17 @@ def _run_pilot_internal(config: PilotConfig) -> Dict[str, Any]:
         secondary = getattr(state.provider, "_secondary", None) if state.provider else None
         if primary is not None and hasattr(primary, "handle_tool_call"):
             primary.handle_tool_call("honcho_context", {"peer": "user", "query": "warm-up"})
+            state.primary_available_at_start = True
+        else:
+            state.primary_available_at_start = False
         if secondary is not None and hasattr(secondary, "handle_tool_call"):
             secondary.handle_tool_call("fuli_memory_add", {"content": "warm-up record", "source": "pilot_warmup", "namespace": state.config.namespace})
     except Exception as exc:
         print(f"[{now_iso()}] Warm-up warning (non-fatal): {exc}")
+        # Warm-up failures are not necessarily fatal, but a primary connection
+        # error during warm-up is a strong signal that the primary is down.
+        if "honcho" in str(exc).lower() or "primary" in str(exc).lower():
+            state.primary_available_at_start = False
 
     def _on_signal(signum, frame):
         print(f"[{now_iso()}] Signal {signum} received; stopping pilot at next interval...")
@@ -543,12 +585,22 @@ def _run_pilot_internal(config: PilotConfig) -> Dict[str, Any]:
             print(f"[{now_iso()}] EXCEPTION on write {state.sequence}: {exc}")
             traceback.print_exc()
 
+        # RSS sampling after warm-up (after the first 5 successful writes, or
+        # at the first heartbeat, whichever comes first). Sample at every write.
+        elapsed = state.elapsed_seconds()
+        rss_now = _process_rss_bytes()
+        if rss_now is not None:
+            if state.warmup_rss_bytes is None and elapsed >= 5.0:
+                state.warmup_rss_bytes = rss_now
+                state.rss_sampling_started = True
+            if state.rss_sampling_started:
+                state.rss_samples.append((elapsed, rss_now))
+
         if time.monotonic() >= next_heartbeat:
             record = heartbeat(state)
             print(f"[{now_iso()}] HEARTBEAT: {record}")
             next_heartbeat = time.monotonic() + 300.0
 
-        elapsed = state.elapsed_seconds()
         sleep_seconds = config.interval_seconds - (elapsed % config.interval_seconds)
         sleep_seconds = min(sleep_seconds, state.remaining_seconds())
         sleep_seconds = max(0.1, sleep_seconds)
@@ -564,6 +616,18 @@ def _run_pilot_internal(config: PilotConfig) -> Dict[str, Any]:
     state.final_rss_bytes = _process_rss_bytes()
     final_record = heartbeat(state)
     _record_storage_health(state)
+    # Sample final RSS as the last entry in the series.
+    if state.final_rss_bytes is not None and state.rss_sampling_started:
+        state.rss_samples.append((state.elapsed_seconds(), state.final_rss_bytes))
+    # Capture primary availability at end of run, before shutdown.
+    try:
+        primary_provider = getattr(state.provider, "_primary", None) if state.provider else None
+        if primary_provider is not None:
+            state.primary_available_at_end = bool(
+                getattr(primary_provider, "is_available", lambda: True)()
+            )
+    except Exception:
+        state.primary_available_at_end = False
     print(f"[{now_iso()}] Final heartbeat: {final_record}")
 
     try:
@@ -591,6 +655,8 @@ def _build_report(
     if not ledger_report["balanced"]:
         return {
             "ok": False,
+            "run_status": "invalid_fuli_ingestion",
+            "status_reason": "mirror accounting unbalanced",
             "phase": "accounting_validation",
             "errors": ledger_report["invariant_errors"] + ["mirror accounting unbalanced"],
             "ledger": ledger_report,
@@ -646,6 +712,7 @@ def _build_report(
     wal_growth_bytes = size_growth.get("fuli.db-wal", 0) + size_growth.get("fuli.db-shm", 0)
     db_growth_bytes = size_growth.get("fuli.db", 0)
 
+    # (Memory growth is now computed by `_rss_report` from the sampled series.)
     memory_growth_bytes: Optional[int] = None
     if state.initial_rss_bytes is not None and state.final_rss_bytes is not None:
         memory_growth_bytes = state.final_rss_bytes - state.initial_rss_bytes
@@ -664,8 +731,10 @@ def _build_report(
         integrity_ok = integrity == ["ok"] if isinstance(integrity, list) else None
         quick_check_ok = quick == ["ok"] if isinstance(quick, list) else None
 
-    # Pass-gate evaluation
-    pass_gates = {
+    # Pass-gate evaluation. These gates describe FULI-side health only.
+    # The primary-side gates live below, and they cannot be overridden by
+    # perfect Fuli mirroring — see run_status decision logic further down.
+    fuli_pass_gates = {
         "accounting_balanced": ledger_report["balanced"] and unexplained == 0,
         "mirror_only_on_success": mirror_attempted <= primary_success,
         "accepted_rate_99": (mirror_attempted / max(primary_success, 1)) >= 0.99,
@@ -676,17 +745,114 @@ def _build_report(
         "sqlite_integrity_ok": integrity_ok is not False,
         "primary_output_unchanged": True,  # measured by classifier; no mutation detected
     }
-    pass_gates_ok = all(pass_gates.values())
+    fuli_pass_gates_ok = all(fuli_pass_gates.values())
+
+    # --- Primary health gate evaluation (added for the 2026-07-13 false-green fix) ---
+    cfg = state.config
+    primary_success_rate_required = cfg.primary_success_rate_required_percent
+    minimum_primary_success_required = cfg.minimum_primary_success_required
+    primary_p95_max_ms = cfg.primary_p95_max_ms
+    primary_timeout_rate_max_pct = cfg.primary_timeout_rate_max_percent
+    sustained_outage_threshold = cfg.sustained_primary_outage_threshold
+
+    primary_availability_gate = bool(state.primary_available_at_start) and bool(
+        state.primary_available_at_end
+    )
+    primary_success_rate_gate = primary_success_rate >= primary_success_rate_required
+    minimum_primary_success_gate = primary_success >= minimum_primary_success_required
+    sustained_primary_outage_detected = (
+        state.max_consecutive_primary_failures >= sustained_outage_threshold
+    )
+
+    primary_timeout_rate_pct = (
+        (state.primary_writes_above_p95_threshold / max(total, 1)) * 100.0 if total else 0.0
+    )
+    primary_p95_latency_gate = _percentile(primary_latencies, 95) <= primary_p95_max_ms if primary_latencies else True
+    primary_timeout_rate_gate = primary_timeout_rate_pct <= primary_timeout_rate_max_pct
+
+    primary_health_gates = {
+        "primary_availability_gate": primary_availability_gate,
+        "primary_success_rate_gate": primary_success_rate_gate,
+        "primary_p95_latency_gate": primary_p95_latency_gate,
+        "primary_timeout_rate_gate": primary_timeout_rate_gate,
+        "minimum_primary_success_gate": minimum_primary_success_gate,
+        "no_sustained_primary_outage": not sustained_primary_outage_detected,
+    }
+    primary_health_gates_ok = all(primary_health_gates.values())
+
+    # --- run_status decision (precedence: integrity > fuli > primary) ---
+    # 1. Integrity failure (SQLite corruption or quick_check fail) is the most
+    #    severe because it implies the run's accounting is not trustworthy.
+    # 2. Fuli ingestion failure implies the secondary side is broken even
+    #    though the primary might be healthy.
+    # 3. Primary issues are ranked by severity: unavailability (sustained
+    #    outage or unreachable primary) > success-rate miss > sample-size miss.
+    run_status = "valid"
+    status_reason = ""
+
+    if integrity_ok is False or quick_check_ok is False:
+        run_status = "invalid_integrity"
+        status_reason = "SQLite integrity or quick-check failed"
+    elif not fuli_pass_gates.get("mirror_only_on_success", False):
+        run_status = "invalid_fuli_ingestion"
+        status_reason = "Fuli mirrored writes not bounded by primary successes"
+    elif not fuli_pass_gates.get("zero_silent_loss", False):
+        run_status = "invalid_fuli_ingestion"
+        status_reason = "silent loss detected in mirror ledger"
+    elif (
+        primary_availability_gate is False
+        or sustained_primary_outage_detected
+        or state.primary_available_at_start is False
+        or state.primary_available_at_end is False
+    ):
+        run_status = "invalid_primary_unavailable"
+        status_reason = (
+            f"primary unavailable: start={state.primary_available_at_start}, "
+            f"end={state.primary_available_at_end}, "
+            f"max_consecutive_failures={state.max_consecutive_primary_failures}"
+        )
+    elif not primary_success_rate_gate:
+        run_status = "invalid_primary_success_rate"
+        status_reason = (
+            f"primary success rate {primary_success_rate:.2f}% below required "
+            f"{primary_success_rate_required:.2f}%"
+        )
+    elif not minimum_primary_success_gate:
+        run_status = "invalid_primary_sample_size"
+        status_reason = (
+            f"primary success count {primary_success} below minimum "
+            f"{minimum_primary_success_required}"
+        )
+    elif not fuli_pass_gates_ok:
+        run_status = "invalid_fuli_ingestion"
+        status_reason = "Fuli ingestion gate failed"
+
+    report_ok = run_status == "valid"
 
     return {
-        "ok": pass_gates_ok,
+        "ok": report_ok,
         "run_id": state.config.run_id,
-        "phase": "completed" if pass_gates_ok else "failed_pass_gates",
+        "phase": "completed" if report_ok else f"invalid_{run_status}",
         "fuli_commit": state.fuli_commit,
         "duration_hours": state.config.duration_hours,
         "interval_seconds": state.config.interval_seconds,
         "started_at": state.started_at_iso(),
         "finished_at": now_iso(),
+        "run_status": run_status,
+        "status_reason": status_reason,
+        "primary_success_rate_percent": round(primary_success_rate, 4),
+        "primary_success_rate_required_percent": primary_success_rate_required,
+        "primary_available_at_start": state.primary_available_at_start,
+        "primary_available_at_end": state.primary_available_at_end,
+        "primary_availability_gate": primary_availability_gate,
+        "minimum_primary_success_required": minimum_primary_success_required,
+        "minimum_primary_success_gate": minimum_primary_success_gate,
+        "sustained_primary_outage_detected": sustained_primary_outage_detected,
+        "max_consecutive_primary_failures": state.max_consecutive_primary_failures,
+        "primary_p95_max_ms": primary_p95_max_ms,
+        "primary_timeout_rate_percent": round(primary_timeout_rate_pct, 4),
+        "primary_timeout_rate_max_percent": primary_timeout_rate_max_pct,
+        "primary_health_gates": primary_health_gates,
         "config": {
             "provider": cfg_get(load_config_safe(), "memory", "provider"),
             "enabled": cfg_get(load_config_safe(), "memory", "shadow", "enabled"),
@@ -719,6 +885,12 @@ def _build_report(
             "primary_p95_ms": _percentile(primary_latencies, 95) if primary_latencies else 0.0,
             "mirror_p50_ms": _percentile(mirror_latencies, 50) if mirror_latencies else 0.0,
             "mirror_p95_ms": _percentile(mirror_latencies, 95) if mirror_latencies else 0.0,
+            # drain_lag_p50_ms measures primary completion -> final drain
+            # confirmation, NOT actual vector-index execution time. The legacy
+            # field indexing_p50_ms is preserved as a deprecated alias for
+            # backward compatibility with existing reports/tests.
+            "drain_lag_p50_ms": _percentile(indexing_latencies, 50) if indexing_latencies else 0.0,
+            "drain_lag_p95_ms": _percentile(indexing_latencies, 95) if indexing_latencies else 0.0,
             "indexing_p50_ms": _percentile(indexing_latencies, 50) if indexing_latencies else 0.0,
             "indexing_p95_ms": _percentile(indexing_latencies, 95) if indexing_latencies else 0.0,
         },
@@ -739,22 +911,71 @@ def _build_report(
             "wal_pages": state.storage_health.get("wal_pages") if state.storage_health else None,
             "wal_size_bytes": state.storage_health.get("wal_size_bytes") if state.storage_health else None,
         },
-        "memory": {
-            "initial_rss_bytes": state.initial_rss_bytes,
-            "final_rss_bytes": state.final_rss_bytes,
-            "growth_bytes": memory_growth_bytes,
-        },
+        "memory": _rss_report(state),
         "storage_health": state.storage_health,
         "lock_retries": lock_retries,
         "integrity": {
             "integrity_ok": integrity_ok,
             "quick_check_ok": quick_check_ok,
         },
-        "pass_gates": pass_gates,
+        "pass_gates": fuli_pass_gates,
         "health": {
             "thread_alive_final": final_record.get("thread_alive"),
             "loop_running_final": final_record.get("loop_running"),
         },
+    }
+
+
+def _rss_report(state: PilotState) -> Dict[str, Any]:
+    """Build the structured RSS report from the sampled series.
+
+    The report includes warm-up RSS, p50/p95/min/max, final RSS, the linear
+    slope of the series (bytes per second), and peak-minus-warmup. RSS
+    decreases are NOT a failure; the caller decides what to do with the trend.
+    """
+    initial = state.initial_rss_bytes
+    final = state.final_rss_bytes
+    warmup = state.warmup_rss_bytes
+    samples = state.rss_samples or []
+
+    growth_bytes: Optional[int] = None
+    if initial is not None and final is not None:
+        growth_bytes = final - initial
+
+    rss_values: List[float] = [float(v) for _, v in samples]
+    rss_p50: Optional[float] = _percentile(rss_values, 50) if rss_values else None
+    rss_p95: Optional[float] = _percentile(rss_values, 95) if rss_values else None
+    rss_max: Optional[float] = max(rss_values) if rss_values else None
+    rss_min: Optional[float] = min(rss_values) if rss_values else None
+
+    # Linear slope via least-squares on the (elapsed_seconds, rss_bytes) samples.
+    slope_bytes_per_sec: Optional[float] = None
+    peak_minus_warmup: Optional[int] = None
+    if warmup is not None and samples:
+        peak_minus_warmup = max(rss_values) - warmup
+    if len(samples) >= 2:
+        xs = [s for s, _ in samples]
+        ys = [v for _, v in samples]
+        n = len(xs)
+        mean_x = sum(xs) / n
+        mean_y = sum(ys) / n
+        num = sum((xs[i] - mean_x) * (ys[i] - mean_y) for i in range(n))
+        den = sum((xs[i] - mean_x) ** 2 for i in range(n))
+        if den > 0:
+            slope_bytes_per_sec = num / den
+
+    return {
+        "initial_rss_bytes": initial,
+        "final_rss_bytes": final,
+        "growth_bytes": growth_bytes,
+        "warmup_rss_bytes": warmup,
+        "rss_p50_bytes": rss_p50,
+        "rss_p95_bytes": rss_p95,
+        "rss_max_bytes": rss_max,
+        "rss_min_bytes": rss_min,
+        "rss_slope_bytes_per_second": slope_bytes_per_sec,
+        "peak_minus_warmup_bytes": peak_minus_warmup,
+        "rss_sample_count": len(rss_values),
     }
 
 

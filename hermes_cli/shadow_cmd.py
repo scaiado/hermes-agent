@@ -84,9 +84,20 @@ def _validate_report(report_path: str | None) -> Dict[str, Any]:
         errors.append(f"primary accounting: {total} != {success} + {failure}")
     if mirror != indexed + pending + failed:
         errors.append(f"mirror accounting: {mirror} != {indexed} + {pending} + {failed}")
+
+    # Reject reports whose run_status indicates an invalid primary environment.
+    # This is the post-2026-07-13 fix: a report can pass Fuli-side gates while
+    # the primary was unavailable, and validate-report must surface that.
+    run_status = data.get("run_status")
+    if run_status and run_status != "valid":
+        errors.append(
+            f"run_status={run_status!r}: {data.get('status_reason') or 'primary environment invalid'}"
+        )
+
     return {
         "ok": len(errors) == 0,
         "report_path": report_path,
         "errors": errors,
         "summary": ledger,
+        "run_status": run_status,
     }
