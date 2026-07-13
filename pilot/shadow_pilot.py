@@ -1306,19 +1306,73 @@ def run_cleanup(run_id: str, dry_run: bool = False, execute: bool = False) -> Di
 # ---------------------------------------------------------------------------
 
 
-def main() -> int:
+def build_pilot_argparser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser used by `main()`.
+
+    Exposed for tests and for tools that want to parse pilot flags without
+    triggering a pilot run. Adding a flag here without updating this function
+    will silently fail tests.
+    """
     parser = argparse.ArgumentParser(description="Hermes shadow-pilot load generator")
     parser.add_argument("--duration-hours", type=float, default=6.0, help="Pilot duration in hours")
     parser.add_argument("--interval-seconds", type=int, default=120, help="Seconds between writes")
     parser.add_argument("--drain-timeout-seconds", type=int, default=120, help="Indexing drain timeout")
     parser.add_argument("--run-id", type=str, default=None, help="Explicit run ID")
-    args = parser.parse_args()
+    # Primary-health gate thresholds. CLI flags (not env vars) so the report
+    # is reproducible and the threshold used at run time is recorded alongside
+    # the run. Defaults match the four-hour P0 soak; the 15-minute qualification
+    # passes --primary-success-rate-required 99.0 and
+    # --minimum-primary-success-required 50.
+    parser.add_argument(
+        "--primary-success-rate-required",
+        type=float,
+        default=99.9,
+        help="Minimum primary success rate (percent) for the run to be valid",
+    )
+    parser.add_argument(
+        "--minimum-primary-success-required",
+        type=int,
+        default=200,
+        help="Minimum successful primary writes for the run to be valid",
+    )
+    parser.add_argument(
+        "--primary-p95-max-ms",
+        type=float,
+        default=10_000.0,
+        help="Absolute SLO: primary p95 latency in milliseconds",
+    )
+    parser.add_argument(
+        "--primary-timeout-rate-max-percent",
+        type=float,
+        default=0.1,
+        help="Absolute SLO: max percentage of primary writes exceeding the p95 threshold",
+    )
+    parser.add_argument(
+        "--sustained-primary-outage-threshold",
+        type=int,
+        default=30,
+        help="Consecutive primary failures that classify the run as invalid_primary_unavailable",
+    )
+    return parser
 
-    config = PilotConfig(
+
+def _config_from_args(args: argparse.Namespace) -> PilotConfig:
+    return PilotConfig(
         duration_hours=args.duration_hours,
         interval_seconds=args.interval_seconds,
         drain_timeout_seconds=args.drain_timeout_seconds,
+        primary_success_rate_required_percent=args.primary_success_rate_required,
+        minimum_primary_success_required=args.minimum_primary_success_required,
+        primary_p95_max_ms=args.primary_p95_max_ms,
+        primary_timeout_rate_max_percent=args.primary_timeout_rate_max_percent,
+        sustained_primary_outage_threshold=args.sustained_primary_outage_threshold,
     )
+
+
+def main() -> int:
+    parser = build_pilot_argparser()
+    args = parser.parse_args()
+    config = _config_from_args(args)
     if args.run_id:
         config.run_id = args.run_id
 

@@ -164,3 +164,29 @@ def test_pilot_cli_routes(tmp_path):
     # Unknown subcommand should be rejected by argparse, not fall through.
     with pytest.raises(SystemExit):
         parser.parse_args(["shadow", "nonexistent"])
+
+
+def test_pilot_cli_threshold_flags_are_wired_into_config():
+    """The new --primary-success-rate-required and --minimum-primary-success-required
+    flags must end up in the PilotConfig and propagate to the report. Without
+    this test, future refactors could break reproducibility silently.
+    """
+    from pilot.shadow_pilot import (
+        PilotConfig,
+        _config_from_args,
+        build_pilot_argparser,
+    )
+
+    parser = build_pilot_argparser()
+    args = parser.parse_args([
+        "--primary-success-rate-required", "99.0",
+        "--minimum-primary-success-required", "50",
+    ])
+    config = _config_from_args(args)
+    assert config.primary_success_rate_required_percent == 99.0
+    assert config.minimum_primary_success_required == 50
+
+    # And the 4-hour default remains in place when the flag is omitted.
+    config_default = PilotConfig()
+    assert config_default.primary_success_rate_required_percent == 99.9
+    assert config_default.minimum_primary_success_required == 200
