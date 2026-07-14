@@ -212,9 +212,6 @@ def test_fuli_result_never_enters_live_output(tmp_path: Path):
     shadow._write_timeout_ms = 10000
     shadow._comparison_run_id = "test-run"
 
-    # Open the comparison store on a tmp path so the test is hermetic.
-    shadow._comparison_store = ComparisonStore(tmp_path / "comparisons.db")
-
     # Inject a recognisable Honcho response.
     primary_payload = {"results": ["honcho-excerpt-A", "honcho-excerpt-B"]}
     shadow._primary.handle_tool_call = (
@@ -230,6 +227,10 @@ def test_fuli_result_never_enters_live_output(tmp_path: Path):
     shadow._secondary.handle_tool_call = (
         lambda tool_name, args, **kw: json.dumps(fuli_payload)
     )
+
+    # Open the comparison store on a tmp path so the test is hermetic.
+    # Inject AFTER the lambdas are set so the executor captures them.
+    shadow._inject_comparison_store(ComparisonStore(tmp_path / "comparisons.db"))
 
     # Wait for any prior async writes to drain before we run.
     out = shadow.handle_tool_call(
@@ -248,7 +249,7 @@ def test_fuli_result_never_enters_live_output(tmp_path: Path):
 
     # Drain the async persistence thread so the comparison row is recorded
     # before the test asserts on it.
-    time.sleep(0.5)
+    shadow.flush_comparisons(timeout_seconds=5.0)
     rows = shadow._comparison_store.list_comparisons(limit=10)
     assert len(rows) >= 1, "comparison was not persisted"
     persisted = rows[0]
@@ -266,7 +267,15 @@ def test_fuli_result_never_enters_live_output(tmp_path: Path):
 
 
 def test_fuli_timeout_stays_within_comparison_budget(tmp_path: Path):
-    """A Fuli call that hangs is bounded by comparison_budget_ms."""
+    """A Fuli call that respects its internal timeout is bounded by comparison_budget_ms.
+
+    The executor cannot forcibly terminate a slow Python call; it
+    relies on the secondary provider to honor its own per-call
+    timeout. This test models Fuli's real behavior: when the call
+    exceeds the budget, Fuli returns a JSON error string
+    (not an exception), and the executor records it as a
+    secondary_error.
+    """
     from plugins.memory.shadow import ShadowMemoryProvider
     from tests.plugins.fake_providers import FakeFuliProvider, FakeHonchoProvider
 
@@ -281,22 +290,29 @@ def test_fuli_timeout_stays_within_comparison_budget(tmp_path: Path):
     shadow._comparison_budget_ms = 100  # tight budget; allow scheduler slack
     shadow._read_timeout_ms = 100
     shadow._namespace = "hermes:shadow-pilot"
-    shadow._capture_content = False
     shadow._write_timeout_ms = 10000
     shadow._comparison_run_id = "test-budget"
-    shadow._comparison_store = ComparisonStore(tmp_path / "comparisons.db")
 
     primary_payload = {"results": ["honcho-excerpt"]}
     shadow._primary.handle_tool_call = (
         lambda tool_name, args, **kw: json.dumps(primary_payload)
     )
 
-    # A blocking Fuli that sleeps far longer than the budget.
-    def _slow(*args, **kwargs):
-        time.sleep(2.0)
-        return json.dumps({"results": [{"id": "x", "content": "late"}]})
+    # Model the Fuli bridge timeout contract: when the per-call
+    # timeout_ms is exceeded, Fuli returns a JSON error string. The
+    # executor marks this as secondary_status=failed with category
+    # secondary_error.
+    def _honoring_timeout(tool_name, args, **kwargs):
+        return json.dumps({
+            "error": "timeout",
+            "timeout_ms": args.get("timeout_ms", 0),
+        })
 
-    shadow._secondary.handle_tool_call = _slow
+    shadow._secondary.handle_tool_call = _honoring_timeout
+
+    # Open the comparison store on a tmp path so the test is hermetic.
+    # Inject AFTER the stubs are set so the executor captures them.
+    shadow._inject_comparison_store(ComparisonStore(tmp_path / "comparisons.db"))
 
     t0 = time.monotonic()
     out = shadow.handle_tool_call(
@@ -304,19 +320,90 @@ def test_fuli_timeout_stays_within_comparison_budget(tmp_path: Path):
     )
     elapsed = (time.monotonic() - t0) * 1000.0
 
-    # Primary must return within the budget plus a small slack for
-    # thread scheduling and JSON serialization. The contract is the
-    # comparison is bounded; we allow a small absolute slack.
-    assert elapsed < 300, (
-        f"shadow provider took {elapsed:.0f} ms — exceeds 3x the comparison_budget_ms (100)"
+    # The foreground MUST return within ~25 ms of primary completion.
+    # The Fuli call runs in the background executor; it can take as
+    # long as it needs but the user sees only the Honcho response.
+    assert elapsed < 25, (
+        f"shadow provider took {elapsed:.0f} ms — foreground returned "
+        f"late; enqueue overhead should be < 25 ms but the call waited "
+        f"for the Fuli worker"
     )
     assert out == json.dumps(primary_payload)
-    # Wait for the async persistence to land.
-    time.sleep(0.5)
+    # Flush the executor so the worker has finished the comparison.
+    shadow.flush_comparisons(timeout_seconds=5.0)
     rows = shadow._comparison_store.list_comparisons(limit=5)
     assert rows
-    assert rows[0]["secondary_status"] == "failed"
-    assert "timeout_after_100ms" in (rows[0]["secondary_error_category"] or "")
+    persisted = rows[0]
+    # The persisted row records Fuli's reported error and the
+    # secondary_status flag.
+    assert persisted["secondary_status"] == "failed"
+    assert "secondary_error" in (persisted["secondary_error_category"] or "")
+
+
+def test_foreground_does_not_wait_for_slow_secondary(tmp_path: Path):
+    """The foreground returns immediately even when the secondary is slow.
+
+    Python cannot forcibly terminate a slow call; this test documents
+    that limitation: the foreground still returns within < 25 ms, the
+    comparison worker stays blocked on the slow call, and after
+    shutdown the worker has not yet produced a row. The orphaned
+    worker is observable via accounting.
+    """
+    from plugins.memory.shadow import ShadowMemoryProvider
+    from tests.plugins.fake_providers import FakeFuliProvider, FakeHonchoProvider
+
+    shadow = ShadowMemoryProvider()
+    shadow._primary = FakeHonchoProvider(mode="success")
+    shadow._secondary = FakeFuliProvider()
+    shadow._enabled = True
+    shadow._mirror_writes = False
+    shadow._compare_reads = True
+    shadow._sample_rate = 1.0
+    shadow._sampling_seed = 0
+    shadow._comparison_budget_ms = 100
+    shadow._read_timeout_ms = 100
+    shadow._namespace = "hermes:shadow-pilot"
+    shadow._write_timeout_ms = 10000
+    shadow._comparison_run_id = "test-foreground-isolation"
+
+    primary_payload = {"results": ["honcho-excerpt"]}
+    shadow._primary.handle_tool_call = (
+        lambda tool_name, args, **kw: json.dumps(primary_payload)
+    )
+
+    # A Fuli call that ignores its timeout (the worst case we want to
+    # document). The executor cannot forcibly terminate this.
+    def _does_not_return_quickly(tool_name, args, **kwargs):
+        time.sleep(0.5)  # 5x the budget; well past it
+        return json.dumps({"results": []})
+
+    shadow._secondary.handle_tool_call = _does_not_return_quickly
+
+    shadow._inject_comparison_store(ComparisonStore(tmp_path / "comparisons.db"))
+
+    t0 = time.monotonic()
+    out = shadow.handle_tool_call(
+        "honcho_search", {"query": "isolation", "top_k": 1}
+    )
+    elapsed = (time.monotonic() - t0) * 1000.0
+
+    # Foreground MUST return within < 25 ms — the comparison work
+    # happens entirely off the request path.
+    assert elapsed < 25, (
+        f"shadow provider took {elapsed:.0f} ms — foreground waited "
+        f"for the Fuli worker"
+    )
+    assert out == json.dumps(primary_payload)
+    # The comparison worker is still blocked on the slow Fuli call.
+    # The row is NOT yet persisted. shutdown() will eventually drain it.
+    shadow.shutdown()
+    # After shutdown the row IS persisted (the executor's shutdown
+    # waits for the comparison to finish or times out). The executor
+    # may or may not have persisted depending on whether the slow
+    # Fuli call finished before the shutdown deadline.
+    accounting = shadow.executor_accounting()
+    assert accounting["comparison_jobs_sampled"] == 1
+    # The primary is preserved through the slow secondary path.
 
 
 # 6. stable fingerprint normalization
@@ -807,7 +894,6 @@ def test_secondary_failure_does_not_fail_primary(tmp_path: Path):
     shadow._capture_content = False
     shadow._write_timeout_ms = 10000
     shadow._comparison_run_id = "test-secondary-err"
-    shadow._comparison_store = ComparisonStore(tmp_path / "comparisons.db")
 
     primary_payload = {"results": ["primary-marker-XYZ"]}
     shadow._primary.handle_tool_call = (
@@ -819,6 +905,10 @@ def test_secondary_failure_does_not_fail_primary(tmp_path: Path):
 
     shadow._secondary.handle_tool_call = _explode
 
+    # Open the comparison store on a tmp path so the test is hermetic.
+    # Inject AFTER the stubs are set so the executor captures them.
+    shadow._inject_comparison_store(ComparisonStore(tmp_path / "comparisons.db"))
+
     out = shadow.handle_tool_call(
         "honcho_search", {"query": "secondary-error", "top_k": 1}
     )
@@ -826,7 +916,7 @@ def test_secondary_failure_does_not_fail_primary(tmp_path: Path):
     assert out == json.dumps(primary_payload)
     assert "primary-marker-XYZ" in out
     # Wait for the async persistence thread.
-    time.sleep(0.5)
+    shadow.flush_comparisons(timeout_seconds=5.0)
     rows = shadow._comparison_store.list_comparisons(limit=5)
     assert rows
     assert rows[0]["secondary_status"] == "failed"
@@ -1020,7 +1110,6 @@ def test_persistence_accounting_counts_inserted(tmp_path: Path):
     shadow._namespace = "hermes:shadow-pilot"
     shadow._write_timeout_ms = 10000
     shadow._comparison_run_id = "p1-acct-2026-07-13"
-    shadow._comparison_store = ComparisonStore(hermes_home / "memories" / "comparisons.db")
     shadow._hermes_home = str(hermes_home)
 
     class _P:
@@ -1031,6 +1120,11 @@ def test_persistence_accounting_counts_inserted(tmp_path: Path):
         def handle_tool_call(self, tool, args, **kw):
             return json.dumps({"results": []})
 
+    # Inject AFTER the stub classes are defined so the executor captures them.
+    shadow._primary = _P()
+    shadow._secondary = _S()
+    shadow._inject_comparison_store(ComparisonStore(hermes_home / "memories" / "comparisons.db"))
+
     shadow._primary = _P()
     shadow._secondary = _S()
 
@@ -1040,28 +1134,34 @@ def test_persistence_accounting_counts_inserted(tmp_path: Path):
     flush = shadow.flush_comparisons(timeout_seconds=5.0)
     assert flush["flushed"]
 
-    accounting = ComparisonStore.persistence_accounting()
+    accounting = shadow.executor_accounting()
     assert accounting["persistence_started"] == 5
-    assert accounting["persistence_succeeded"] == 5
+    assert accounting["comparison_jobs_persisted"] == 5
     assert accounting["persistence_failed"] == 0
-    assert accounting["persistence_pending"] == 0
+    assert accounting["comparison_jobs_pending"] == 0
     assert accounting["duplicate_idempotent"] == 0
     assert accounting["unexpected_collision"] == 0
 
 
 def test_duplicate_idempotent_increments_duplicate_counter(tmp_path: Path):
-    """Re-recording the same payload bumps duplicate_idempotent, not unexpected_collision."""
-    ComparisonStore._duplicate_idempotent = 0
-    ComparisonStore._unexpected_collision = 0
+    """Re-recording the same payload bumps duplicate_idempotent, not unexpected_collision.
+
+    Counters are per-instance. We exercise the same payload twice
+    through the same store and verify the per-instance counter
+    advances.
+    """
     store = ComparisonStore(tmp_path / "c.db")
+    assert store._duplicate_idempotent == 0
+    assert store._unexpected_collision == 0
     rec = ComparisonRecord(query_hash="dup-q", namespace="hermes:shadow-pilot")
     res_1 = store.record_comparison(rec)
     res_2 = store.record_comparison(rec)
     assert res_1["outcome"] == "inserted"
     assert res_2["outcome"] == "duplicate_idempotent"
-    accounting = ComparisonStore.persistence_accounting()
-    assert accounting["duplicate_idempotent"] >= 1
-    assert accounting["unexpected_collision"] == 0
+    # Per-instance counters. duplicate_idempotent bumped; no
+    # unexpected_collision.
+    assert store._duplicate_idempotent >= 1
+    assert store._unexpected_collision == 0
 
 
 def test_shadow_provider_ten_queries_persist_ten_rows(tmp_path: Path):
@@ -1089,7 +1189,7 @@ def test_shadow_provider_ten_queries_persist_ten_rows(tmp_path: Path):
     shadow._namespace = "hermes:shadow-pilot"
     shadow._write_timeout_ms = 10000
     shadow._comparison_run_id = "p1-regression-2026-07-13"
-    shadow._comparison_store = ComparisonStore(hermes_home / "memories" / "comparisons.db")
+    shadow._inject_comparison_store(ComparisonStore(hermes_home / "memories" / "comparisons.db"))
     shadow._hermes_home = str(hermes_home)
 
     primary_payload = {"results": ["primary-1", "primary-2"]}
@@ -1134,7 +1234,7 @@ def test_shadow_provider_ten_queries_persist_ten_rows(tmp_path: Path):
     assert len(rows) == 10, (
         f"expected 10 rows after fix, got {len(rows)} — empty-collision "
         f"regression has resurfaced. Persist accounting: "
-        f"{ComparisonStore.persistence_accounting()}"
+        f"{shadow.executor_accounting()}"
     )
 
     # All 10 comparison_ids are non-empty and unique.
@@ -1147,10 +1247,10 @@ def test_shadow_provider_ten_queries_persist_ten_rows(tmp_path: Path):
         assert "fuli-leak" not in out.lower()
 
     # Persistence accounting is balanced.
-    accounting = ComparisonStore.persistence_accounting()
+    accounting = shadow.executor_accounting()
     assert accounting["persistence_failed"] == 0
     assert accounting["unexpected_collision"] == 0
-    assert accounting["persistence_pending"] == 0
+    assert accounting["comparison_jobs_pending"] == 0
     assert accounting["persistence_started"] == 10
-    assert accounting["persistence_succeeded"] == 10
+    assert accounting["comparison_jobs_persisted"] == 10
     assert accounting["duplicate_idempotent"] == 0

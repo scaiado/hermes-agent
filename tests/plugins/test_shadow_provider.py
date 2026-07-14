@@ -7,6 +7,8 @@ import pytest
 
 from plugins.memory.shadow import ShadowMemoryProvider
 from plugins.memory.shadow.shadow_store import ShadowEvidenceStore
+from pilot.comparison_executor import ComparisonExecutor
+from pilot.comparison_store import ComparisonStore
 from tests.plugins.fake_providers import FakeFuliProvider, FakeHonchoProvider
 
 
@@ -26,7 +28,31 @@ def tmp_shadow(tmp_path):
     shadow._namespace = "hermes:shadow-test"
     shadow._capture_content = True
     shadow._store = shadow._create_store(str(store_path))
-    return shadow, primary, secondary, store_path
+    # Comparison store + executor. Tests that exercise the read path
+    # call shadow.flush_comparisons(timeout_seconds=...) before
+    # asserting on the secondary's recorded calls.
+    shadow._comparison_store = ComparisonStore(tmp_path / "comparisons.db")
+    shadow._comparison_run_id = "tmp-shadow-fixture"
+    shadow._executor = ComparisonExecutor(
+        max_workers=1,
+        max_queue_size=64,
+        comparison_budget_ms=1000,
+    )
+    shadow._executor.start_persistence_worker(shadow._comparison_store)
+    shadow._executor.initialize(secondary.handle_tool_call)
+
+    # Ensure the executor's threads are stopped when the fixture tears
+    # down. Without this, the persistence worker's loop keeps the
+    # pytest worker alive past the test.
+    def _finalize() -> None:
+        try:
+            if shadow._executor is not None:
+                shadow._executor.shutdown(drain_timeout_seconds=0.5)
+        except Exception:
+            pass
+
+    yield shadow, primary, secondary, store_path
+    _finalize()
 
 
 def test_success_mirror_writes_to_fuli(tmp_shadow):
@@ -162,16 +188,35 @@ def test_write_timeout_used_for_mirror(tmp_shadow):
 
 
 def test_read_timeout_used_for_compare(tmp_shadow):
-    """Shadow read comparisons pass the configured read_timeout_ms to Fuli."""
+    """Shadow read comparisons pass the configured comparison_budget_ms to Fuli.
+
+    The comparison runs in the background executor, so the test flushes
+    before asserting on the secondary's recorded calls. The executor
+    uses ``comparison_budget_ms`` (not the legacy ``_read_timeout_ms``)
+    as the Fuli call's timeout.
+    """
     shadow, primary, secondary, _ = tmp_shadow
     shadow._compare_reads = True
     shadow._sample_rate = 1.0
-    shadow._read_timeout_ms = 678
+    # The fixture constructs the executor with comparison_budget_ms=1000.
+    # Reset it to the test's expected value by tearing down and rebuilding.
+    if shadow._executor is not None:
+        shadow._executor.shutdown(drain_timeout_seconds=0.5)
+    shadow._comparison_budget_ms = 678
+    shadow._executor = ComparisonExecutor(
+        max_workers=1,
+        max_queue_size=64,
+        comparison_budget_ms=678,
+    )
+    shadow._executor.start_persistence_worker(shadow._comparison_store)
+    shadow._executor.initialize(secondary.handle_tool_call)
     shadow.handle_tool_call(
         "honcho_search",
         {"query": "compare test"},
         pilot_meta={"correlation_id": "corr-10", "pilot_sequence": 10},
     )
+    # Foreground must return without waiting for the executor.
+    shadow.flush_comparisons(timeout_seconds=5.0)
     assert len(secondary.search_calls) == 1
     assert secondary.search_calls[0]["timeout_ms"] == 678
 

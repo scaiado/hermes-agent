@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
+from pilot.comparison_executor import ComparisonExecutor, ComparisonJob
 from pilot.primary_classifier import PrimaryResult, classify_honcho_result
 from pilot.comparison_metrics import (
     missing_from,
@@ -69,7 +70,18 @@ class ShadowMemoryProvider(MemoryProvider):
         # Deterministic sampling: same (seed, query, namespace) -> same decision.
         self._sampling_seed: int = 0
         # Hard wall-clock cap on a single comparison's secondary work.
-        self._comparison_budget_ms: int = 250
+        # Applies only inside the background executor; never blocks the
+        # foreground request. Default is 2000 ms (P1 qualification budget).
+        # The previous default of 250 ms was inherited from the legacy
+        # read_timeout_ms but is too tight for the Fuli async-bridge
+        # tail-latency spikes observed in the latency probe.
+        self._comparison_budget_ms: int = 2000
+        # Background executor sizing. Default: 1 worker (the Fuli async
+        # bridge loop is shared, so concurrent searches contend), 1024
+        # queued jobs (1 in 20 calls at sample_rate=0.05, even at
+        # thousands of QPS this absorbs many minutes of slack).
+        self._max_workers: int = 1
+        self._max_queue_size: int = 1024
         # Legacy single timeout (fallback), then operation-specific overrides.
         self._timeout_ms: int = 250
         self._write_timeout_ms: int = 10000
@@ -83,13 +95,12 @@ class ShadowMemoryProvider(MemoryProvider):
         # Run id the shadow provider attributes comparisons to. Defaults to
         # the session id until the caller overrides it.
         self._comparison_run_id: str = "shadow-default"
-        # Bounded tracker for in-flight async persistence threads. Each
-        # call to _persist_comparison_async appends a Thread here; the
-        # thread removes itself when it finishes. flush_comparisons()
-        # joins all of them. We cap the list size to prevent unbounded
-        # growth in long-running sessions.
-        self._persistence_threads: List[threading.Thread] = []
-        self._persistence_lock = threading.Lock()
+        # Bounded background executor for sampled-read comparisons. Owned
+        # by the provider; flush_comparisons and shutdown delegate to it.
+        # Initialized lazily in initialize() so providers can configure
+        # max_workers, max_queue_size, and comparison_budget_ms from config
+        # before the threads start.
+        self._executor: Optional["ComparisonExecutor"] = None
 
     @property
     def name(self) -> str:
@@ -114,7 +125,9 @@ class ShadowMemoryProvider(MemoryProvider):
             {"key": "compare_reads", "description": "Compare read results between providers.", "required": False},
             {"key": "sample_rate", "description": "Fraction of reads to compare (0.0-1.0).", "required": False},
             {"key": "sampling_seed", "description": "Integer seed for deterministic sampling (default 0).", "required": False},
-            {"key": "comparison_budget_ms", "description": "Hard wall-clock cap on a single comparison's secondary work (default 250).", "required": False},
+            {"key": "comparison_budget_ms", "description": "Wall-clock cap on a single Fuli search inside the background executor (default 2000). Never affects the foreground request.", "required": False},
+            {"key": "comparison_max_workers", "description": "Number of background Fuli-search workers (default 1, max 8).", "required": False},
+            {"key": "comparison_max_queue_size", "description": "Maximum queued comparison jobs before enqueue returns False (default 1024).", "required": False},
             {"key": "timeout_ms", "description": "Legacy secondary timeout in milliseconds (fallback).", "required": False},
             {"key": "write_timeout_ms", "description": "Secondary write timeout in milliseconds (default: 10000).", "required": False},
             {"key": "read_timeout_ms", "description": "Secondary read/search timeout in milliseconds (default: 250).", "required": False},
@@ -166,6 +179,20 @@ class ShadowMemoryProvider(MemoryProvider):
         except (TypeError, ValueError):
             self._comparison_budget_ms = 250
         self._comparison_budget_ms = max(50, self._comparison_budget_ms)
+        # Executor sizing. Defaults are conservative: 1 worker, 1024
+        # queued jobs. The 5% sample rate means 1 in 20 calls is
+        # enqueued; even at thousands of QPS, 1024 jobs absorb several
+        # minutes of slack.
+        try:
+            self._max_workers = int(shadow.get("comparison_max_workers", 1))
+        except (TypeError, ValueError):
+            self._max_workers = 1
+        self._max_workers = max(1, min(8, self._max_workers))
+        try:
+            self._max_queue_size = int(shadow.get("comparison_max_queue_size", 1024))
+        except (TypeError, ValueError):
+            self._max_queue_size = 1024
+        self._max_queue_size = max(1, self._max_queue_size)
         try:
             self._timeout_ms = int(shadow.get("timeout_ms", self._timeout_ms))
         except (TypeError, ValueError):
@@ -253,6 +280,17 @@ class ShadowMemoryProvider(MemoryProvider):
             kwargs.get("comparison_run_id") or session_id or "shadow-default"
         )
 
+        # Construct the bounded background executor for sampled-read
+        # comparisons. The executor is owned by the provider and persists
+        # for the lifetime of the session. flush_comparisons and
+        # shutdown both delegate to it.
+        self._executor = ComparisonExecutor(
+            max_workers=self._max_workers,
+            max_queue_size=self._max_queue_size,
+            comparison_budget_ms=self._comparison_budget_ms,
+        )
+        self._executor.start_persistence_worker(self._comparison_store)
+
         # Load primary. If already injected (tests), skip discovery.
         if self._primary is None:
             try:
@@ -288,6 +326,12 @@ class ShadowMemoryProvider(MemoryProvider):
             except Exception as exc:
                 logger.warning("Shadow secondary initialize failed: %s", exc)
                 self._secondary = None
+
+        # Wire the executor to the secondary provider's tool-call entry.
+        # The executor runs all Fuli calls via this callable in the
+        # background thread pool; the foreground never calls Fuli.
+        if self._executor is not None and self._secondary is not None:
+            self._executor.initialize(self._secondary.handle_tool_call)
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         if self._primary is None:
@@ -326,15 +370,18 @@ class ShadowMemoryProvider(MemoryProvider):
                 query_text = args.get("query", "") or ""
                 q_hash = query_hash_for(query_text)
                 decision = self._should_sample(q_hash)
-                if decision.sample:
-                    # Hard safety: comparison work happens AFTER primary
-                    # returned. It is bounded by self._comparison_budget_ms
-                    # and cannot fail the user request.
-                    self._compare_read(
-                        tool_name,
-                        args,
-                        primary_result,
-                        primary_latency_ms,
+                if decision.sample and self._executor is not None:
+                    # Enqueue the comparison job for the background
+                    # executor. The executor is responsible for the Fuli
+                    # call, the metrics, the persistence, and the
+                    # timeout. The foreground thread never blocks here
+                    # beyond the put_nowait() on the bounded queue
+                    # (target: < 2 ms p50, < 10 ms p95, absolute < 25 ms).
+                    self._enqueue_comparison(
+                        tool_name=tool_name,
+                        args=args,
+                        primary_result=primary_result,
+                        primary_latency_ms=primary_latency_ms,
                         query_hash=q_hash,
                         decision=decision,
                     )
@@ -343,8 +390,87 @@ class ShadowMemoryProvider(MemoryProvider):
 
         # Final, non-negotiable contract: the primary result is the only
         # thing returned to the live caller, regardless of what happened
-        # above. The Honcho plugin never sees Fuli output.
+        # above. The Honcho plugin never sees Fuli output. The Fuli call,
+        # if any, runs entirely off the foreground request thread.
         return primary_result
+
+    def _enqueue_comparison(
+        self,
+        *,
+        tool_name: str,
+        args: Dict[str, Any],
+        primary_result: str,
+        primary_latency_ms: float,
+        query_hash: str,
+        decision: SamplingDecision,
+    ) -> None:
+        """Build an immutable ComparisonJob and hand it to the executor.
+
+        Called from the foreground request thread. The contract is:
+          - this method returns in < 25 ms absolute (target: p95 < 10 ms)
+          - it never calls Fuli directly
+          - it never blocks on the Fuli call
+          - queue-full is recorded but never fails the primary response
+          - the raw primary result text is dropped at enqueue time;
+            only fingerprints are carried into the job
+        """
+        if self._executor is None:
+            return
+        # Build the immutable record. comparison_id and timestamp will
+        # be assigned by record_comparison() on the persistence worker.
+        top_k = int(args.get("top_k", 5) or 5)
+        comparison = ComparisonRecord(
+            run_id=self._comparison_run_id,
+            namespace=self._namespace,
+            query_hash=query_hash,
+            query_type="unclassified",
+            requested_top_k=top_k,
+            primary_provider=self._primary_name,
+            secondary_provider=self._secondary_name,
+            primary_latency_ms=primary_latency_ms,
+            secondary_latency_ms=0.0,
+            primary_status="success",
+            secondary_status="pending",
+        )
+        # Pre-compute the primary fingerprints now (cheap) so the
+        # background worker can skip the work. The raw primary
+        # response is consumed here and not stored anywhere.
+        primary_results = self._extract_results(primary_result)
+        if primary_results is not None:
+            comparison.primary_result_fingerprints = result_fingerprints(
+                primary_results, limit=top_k
+            )
+        else:
+            comparison.primary_error_category = "primary_parse_error"
+        # Secondary search args: the minimum Fuli needs to execute the
+        # call. The raw query is included here because Fuli cannot
+        # execute a search on a hash. This dict is in-memory only and
+        # is NEVER logged or persisted.
+        secondary_search_args = {
+            "query": args.get("query", ""),
+            "top_k": top_k,
+            "namespace": self._namespace,
+            "timeout_ms": self._comparison_budget_ms,
+        }
+        import uuid as _uuid
+        job = ComparisonJob(
+            job_id=str(_uuid.uuid4()),
+            comparison=comparison,
+            secondary_search_args=secondary_search_args,
+            primary_result_fingerprints=list(
+                comparison.primary_result_fingerprints
+            ),
+            primary_provider=self._primary_name,
+            primary_status="success",
+            primary_latency_ms=primary_latency_ms,
+            query_hash=query_hash,
+            decision_bucket=decision.bucket,
+            enqueued_at_monotonic=time.monotonic(),
+        )
+        # Hand off. put_nowait either succeeds (queue has room) or
+        # raises queue.Full (the executor increments its dropped
+        # counter and returns False). The foreground does NOT wait.
+        self._executor.enqueue(job)
 
     def _mirror_write(
         self,
@@ -466,118 +592,6 @@ class ShadowMemoryProvider(MemoryProvider):
             })
         return outcome
 
-    def _compare_read(
-        self,
-        tool_name: str,
-        args: Dict[str, Any],
-        primary_result: str,
-        primary_latency_ms: float,
-        *,
-        query_hash: str,
-        decision: SamplingDecision,
-    ) -> None:
-        """Run a comparison between primary and secondary search results.
-
-        Hard safety guarantees (also enforced by tests):
-          - The comparison runs in a worker thread bounded by
-            self._comparison_budget_ms; the primary result has already
-            been returned to the caller regardless.
-          - The comparison never fails the user request: all exceptions
-            are caught and recorded as ``secondary_error_category``.
-          - Fuli's response is never propagated into the primary result
-            string. The primary string is captured at function entry; if
-            it changes during comparison (it should not), the comparison
-            is aborted.
-          - The schema has no raw-content column; content_captured is
-            always False. Any future caller that flips it would still not
-            leak content, but the flag is recorded for audit.
-        """
-        # Hard safety: snapshot the primary result string. If anything in
-        # the comparison flow ever tries to mutate it (it should not), we
-        # abort the comparison.
-        primary_result_snapshot = primary_result
-
-        comparison = ComparisonRecord(
-            # comparison_id and timestamp are auto-generated by
-            # ComparisonStore.record_comparison. Passing empty strings
-            # here used to collide on the PK and silently drop 9/10 rows
-            # in the P1 dry-run; leaving them as None lets the store
-            # synthesize a fresh UUID per record.
-            run_id=self._comparison_run_id,
-            namespace=self._namespace,
-            query_hash=query_hash,
-            query_type="unclassified",
-            requested_top_k=int(args.get("top_k", 5) or 5),
-            primary_provider=self._primary_name,
-            secondary_provider=self._secondary_name,
-            primary_latency_ms=primary_latency_ms,
-            secondary_latency_ms=0.0,
-            primary_status="success",
-            secondary_status="pending",
-        )
-
-        primary_results = self._extract_results(primary_result)
-        primary_fps = result_fingerprints(primary_results, limit=comparison.requested_top_k)
-        primary_error_category: Optional[str] = None
-        if primary_results is None:
-            primary_error_category = "primary_parse_error"
-
-        comparison.primary_result_fingerprints = primary_fps
-
-        secondary_results: Optional[List[Any]] = None
-        secondary_error_category: Optional[str] = None
-        secondary_latency_ms = 0.0
-
-        if self._secondary is not None and primary_error_category is None:
-            sec_start = time.monotonic()
-            secondary_results, secondary_error_category = self._bounded_secondary_search(
-                args, comparison.requested_top_k
-            )
-            secondary_latency_ms = (time.monotonic() - sec_start) * 1000.0
-            comparison.secondary_latency_ms = secondary_latency_ms
-            if secondary_error_category is None:
-                comparison.secondary_status = "success"
-            else:
-                comparison.secondary_status = "failed"
-        else:
-            comparison.secondary_status = "skipped"
-
-        secondary_fps = (
-            result_fingerprints(secondary_results, limit=comparison.requested_top_k)
-            if secondary_results is not None
-            else []
-        )
-        comparison.secondary_result_fingerprints = secondary_fps
-
-        k = comparison.requested_top_k
-        comparison.overlap_at_1 = overlap_at_k(primary_fps, secondary_fps, 1)
-        comparison.overlap_at_3 = overlap_at_k(primary_fps, secondary_fps, 3)
-        comparison.overlap_at_5 = overlap_at_k(primary_fps, secondary_fps, k)
-        comparison.reciprocal_rank_agreement = reciprocal_rank_agreement(
-            primary_fps, secondary_fps
-        )
-        comparison.missing_from_primary = missing_from(primary_fps, secondary_fps, k)
-        comparison.missing_from_secondary = missing_from(secondary_fps, primary_fps, k)
-        comparison.primary_error_category = primary_error_category
-        comparison.secondary_error_category = secondary_error_category
-        comparison.secondary_retrieval_mode = self._detect_retrieval_mode(args)
-        # content_captured is hard-locked to False. Schema has no raw-content
-        # column; this flag is purely an audit trail.
-        comparison.content_captured = False
-
-        # Persist asynchronously with a hard wall-clock cap. We use a daemon
-        # thread so the live request never waits on the write. If the budget
-        # is exceeded the worker is left to finish in the background but the
-        # caller has already moved on.
-        self._persist_comparison_async(comparison)
-
-        # Defence: confirm primary_result_snapshot wasn't mutated.
-        if primary_result_snapshot != primary_result:
-            logger.error(
-                "Shadow primary result mutated during comparison; aborting. "
-                "This is a critical invariant violation."
-            )
-
     def _extract_results(self, primary_result: str) -> Optional[List[Any]]:
         """Parse the primary result string into a comparable list.
 
@@ -603,147 +617,38 @@ class ShadowMemoryProvider(MemoryProvider):
                     return [data[k]]
         return [data]
 
-    def _bounded_secondary_search(
-        self, args: Dict[str, Any], top_k: int
-    ) -> tuple[Optional[List[Any]], Optional[str]]:
-        """Call Fuli with a hard wall-clock budget; never raise."""
-        assert self._secondary is not None
-        search_args = {
-            "query": args.get("query", ""),
-            "top_k": top_k,
-            "namespace": self._namespace,
-            "timeout_ms": self._read_timeout_ms,
-        }
-        deadline = time.monotonic() + (self._comparison_budget_ms / 1000.0)
-        result_container: Dict[str, Any] = {}
-
-        def _runner() -> None:
-            try:
-                raw = self._secondary.handle_tool_call(
-                    "fuli_memory_search", search_args
-                )
-                result_container["raw"] = raw
-            except Exception as exc:
-                result_container["error"] = str(exc)
-
-        thread = threading.Thread(
-            target=_runner,
-            name=f"shadow-compare-{query_hash_for(args.get('query', ''))}",
-            daemon=True,
-        )
-        thread.start()
-        thread.join(timeout=max(0.05, deadline - time.monotonic()))
-        if thread.is_alive():
-            return None, f"timeout_after_{self._comparison_budget_ms}ms"
-        if "error" in result_container:
-            return None, f"secondary_error: {result_container['error']}"
-        raw = result_container.get("raw", "")
-        try:
-            data = json.loads(raw)
-        except Exception as exc:
-            return None, f"secondary_parse_error: {exc}"
-        if isinstance(data, dict):
-            results = data.get("results")
-            if isinstance(results, list):
-                return list(results), None
-            return None, "secondary_shape_error"
-        if isinstance(data, list):
-            return list(data), None
-        return None, "secondary_shape_error"
-
-    def _persist_comparison_async(self, comparison: ComparisonRecord) -> None:
-        """Persist a comparison in a background thread.
-
-        The thread is daemon so it cannot block process exit. If the write
-        fails (DB lock, IO error), the failure is recorded via the
-        ComparisonStore's class-level counters so the operator can
-        observe it via ``persistence_accounting()`` and the dry-run script
-        can assert on it.
-        """
-        store = self._comparison_store
-        if store is None:
-            return
-
-        ComparisonStore._persistence_started += 1
-        ComparisonStore._persistence_pending += 1
-
-        def _writer() -> None:
-            try:
-                result = store.record_comparison(comparison)
-                if result.get("outcome") == "inserted":
-                    ComparisonStore._persistence_succeeded += 1
-                # duplicate_idempotent is incremented inside record_comparison
-            except Exception as exc:
-                ComparisonStore._persistence_failed += 1
-                logger.warning(
-                    "Shadow comparison persistence failed for query_hash=%s "
-                    "run_id=%s comparison_id=%s: %s",
-                    comparison.query_hash,
-                    comparison.run_id,
-                    comparison.comparison_id,
-                    exc,
-                )
-            finally:
-                ComparisonStore._persistence_pending -= 1
-                # Best-effort: remove the finished thread from the tracker.
-                # We can't remove by identity without holding the lock; in
-                # the worst case flush_comparisons will join an already-
-                # completed thread which returns immediately.
-                current = threading.current_thread()
-                with self._persistence_lock:
-                    if current in self._persistence_threads:
-                        self._persistence_threads.remove(current)
-
-        thread = threading.Thread(
-            target=_writer,
-            name=f"shadow-persist-{comparison.query_hash}",
-            daemon=True,
-        )
-        with self._persistence_lock:
-            # Prune finished threads before appending. Keeps the list
-            # bounded under sustained traffic.
-            self._persistence_threads = [
-                t for t in self._persistence_threads if t.is_alive()
-            ]
-            self._persistence_threads.append(thread)
-        thread.start()
-
     def flush_comparisons(self, timeout_seconds: float = 5.0) -> Dict[str, Any]:
-        """Wait for in-flight comparison persistence threads to finish.
+        """Wait for all in-flight comparison jobs to finish.
 
-        The shadow provider's comparison work is asynchronous by design
-        (the primary response must not wait for Fuli). This method gives
-        the caller a deterministic join: the dry-run script and the
-        pilot report generator both call it before reading the
-        comparison store.
+        Delegates to the bounded ComparisonExecutor. The dry-run
+        script and the pilot report generator both call this before
+        reading the comparison store.
 
-        Returns a dict with the post-flush accounting (counters and a
-        ``flushed`` flag). The caller can compare against expectations
-        (e.g. ``sampled == 10``) to detect a row-dropped bug.
+        Returns a dict with the post-flush accounting (12+ counters
+        plus a ``flushed`` flag). The caller can compare against
+        expectations (e.g. ``sampled == 10``) to detect a row-dropped
+        bug.
         """
-        deadline = time.monotonic() + max(0.1, timeout_seconds)
-        with self._persistence_lock:
-            pending = list(self._persistence_threads)
-        for t in pending:
-            remaining = max(0.0, deadline - time.monotonic())
-            t.join(timeout=remaining)
-            if not t.is_alive():
-                continue
-            # Deadline hit: a thread is still running. Surface that.
-            with self._persistence_lock:
-                still_alive = [t for t in self._persistence_threads if t.is_alive()]
-            return {
-                "flushed": False,
-                "deadline_hit": True,
-                "remaining_alive_threads": len(still_alive),
-                "persistence_accounting": ComparisonStore.persistence_accounting(),
-            }
-        return {
-            "flushed": True,
-            "deadline_hit": False,
-            "remaining_alive_threads": 0,
-            "persistence_accounting": ComparisonStore.persistence_accounting(),
-        }
+        if self._executor is None:
+            return {"flushed": True, "executor_accounting": {}}
+        return self._executor.flush(timeout_seconds=timeout_seconds)
+
+    def executor_accounting(self) -> Dict[str, int]:
+        """Return the current executor accounting snapshot.
+
+        Convenience pass-through. Returns an empty dict if the
+        executor is not initialized (e.g. the provider never ran a
+        sampled read).
+        """
+        if self._executor is None:
+            return {}
+        return self._executor.accounting()
+
+    def executor_is_balanced(self) -> bool:
+        """True iff the executor's accounting is internally consistent."""
+        if self._executor is None:
+            return True
+        return self._executor.is_balanced()
 
     @staticmethod
     def _detect_retrieval_mode(args: Dict[str, Any]) -> str:
@@ -809,19 +714,33 @@ class ShadowMemoryProvider(MemoryProvider):
                 logger.debug("Shadow secondary on_session_end failed: %s", exc)
 
     def shutdown(self) -> None:
-        # Best-effort: flush any in-flight comparison persistence threads
-        # before tearing down the providers. We allow a short budget
-        # because shutdown is on the caller's critical path.
-        try:
-            self.flush_comparisons(timeout_seconds=2.0)
-        except Exception as exc:
-            logger.debug("Shadow flush_comparisons at shutdown failed: %s", exc)
+        """Six-step drain.
+
+        1. Stop accepting new comparison jobs.
+        2. Drain the comparison queue within the deadline.
+        3. Drain the persistence queue within the deadline.
+        4. Record remaining / lost jobs.
+        5. Shut down the secondary provider.
+        6. Shut down the primary provider.
+
+        The shutdown budget is intentionally small (2 seconds) because
+        shutdown is on the caller's critical path. The dry-run script
+        uses an explicit flush_comparisons(timeout_seconds=...) instead.
+        """
+        # Step 1+2+3+4: drain the executor.
+        if self._executor is not None:
+            try:
+                self._executor.shutdown(drain_timeout_seconds=2.0)
+            except Exception as exc:
+                logger.debug("Shadow executor shutdown failed: %s", exc)
+        # Step 5: shut down the secondary provider.
         if self._secondary is not None:
             try:
                 self._secondary.shutdown()
             except Exception as exc:
                 logger.debug("Shadow secondary shutdown failed: %s", exc)
             self._secondary = None
+        # Step 6: shut down the primary provider.
         if self._primary is not None:
             try:
                 self._primary.shutdown()
@@ -836,6 +755,45 @@ class ShadowMemoryProvider(MemoryProvider):
 
     def _inject_secondary(self, provider: MemoryProvider) -> None:
         self._secondary = provider
+
+    def _inject_comparison_store(self, store: ComparisonStore) -> None:
+        """Test hook: attach a ComparisonStore and start a fresh executor.
+
+        Defensive shutdown: the OLD executor's persistence worker is
+        an infinite loop. ``shutdown(wait=True)`` on the
+        ThreadPoolExecutor would block forever; we use a defensive
+        timeout to bound it. Even on timeout, the OLD executor's
+        ``_stop_event`` is set so the worker exits promptly, and the
+        threads are reaped at interpreter shutdown (they are
+        non-daemon by default; for production paths, prefer
+        ``ComparisonExecutor.shutdown()`` which uses ``wait=False``).
+        """
+        self._comparison_store = store
+        if self._executor is not None:
+            old = self._executor
+            # Always set the stop event first so the persistence
+            # worker exits promptly. Then run shutdown with a hard
+            # cap. Even if shutdown hangs, the worker is gone.
+            try:
+                old._stop_event.set()
+            except Exception:
+                pass
+            try:
+                # Use wait=False so this never blocks past the
+                # call. The OLD executor's threads (including the
+                # persistence worker, which may have already exited
+                # via the stop event) are abandoned.
+                old.shutdown(drain_timeout_seconds=0.1)
+            except Exception:
+                pass
+        self._executor = ComparisonExecutor(
+            max_workers=self._max_workers,
+            max_queue_size=self._max_queue_size,
+            comparison_budget_ms=self._comparison_budget_ms,
+        )
+        self._executor.start_persistence_worker(self._comparison_store)
+        if self._secondary is not None:
+            self._executor.initialize(self._secondary.handle_tool_call)
 
     def _report(self) -> Dict[str, Any]:
         if self._store is None:

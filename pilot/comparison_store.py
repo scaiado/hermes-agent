@@ -127,6 +127,15 @@ class ComparisonRecord:
     missing_from_secondary: List[str] = field(default_factory=list)
     secondary_retrieval_mode: str = "unknown"
     content_captured: bool = False
+    # Background-job timing fields. Populated by the executor.
+    # ``queue_wait_ms`` is the time the job sat in the comparison queue
+    # before a worker picked it up. ``secondary_latency_ms`` is the
+    # wall-clock Fuli call duration inside the worker (bounded by
+    # comparison_budget_ms). The schema does not store these yet;
+    # they are in-memory diagnostics surfaced via flush/shutdown
+    # accounting and are not persisted to the comparisons table.
+    queue_wait_ms: float = 0.0
+    secondary_latency_ms: float = 0.0
     adjudication_status: str = "pending"
     schema_version: int = SCHEMA_VERSION
 
@@ -169,6 +178,16 @@ class ComparisonStore:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
+        # Per-instance counters (preferred). The class-level counters
+        # below are kept as fallbacks for tests that read them via
+        # class attribute, but production code should use
+        # ``persistence_accounting()`` instead.
+        self._persistence_started = 0
+        self._persistence_succeeded = 0
+        self._persistence_failed = 0
+        self._persistence_pending = 0
+        self._duplicate_idempotent = 0
+        self._unexpected_collision = 0
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
@@ -360,19 +379,19 @@ class ComparisonStore:
                 if existing is None:
                     # The integrity error was not a duplicate key. It is
                     # a real schema/constraint failure; surface it.
-                    ComparisonStore._unexpected_collision += 1
+                    self._unexpected_collision += 1
                     raise ComparisonStoreError(
                         f"unexpected sqlite3.IntegrityError for "
                         f"comparison_id={record.comparison_id!r}: {exc}"
                     ) from exc
                 if _row_payload_matches(existing, payload):
-                    ComparisonStore._duplicate_idempotent += 1
+                    self._duplicate_idempotent += 1
                     return {
                         "comparison_id": record.comparison_id,
                         "outcome": "duplicate_idempotent",
                     }
                 # Same ID, different payload — this is a real bug.
-                ComparisonStore._unexpected_collision += 1
+                self._unexpected_collision += 1
                 raise ComparisonStoreError(
                     f"unexpected_id_collision: comparison_id="
                     f"{record.comparison_id!r} already exists with a "
@@ -613,6 +632,12 @@ def _row_payload_matches(row: sqlite3.Row, payload: tuple) -> bool:
     """
     stored = _row_to_comparison_dict(row)
     # The 27 INSERT columns, in the same order as the payload tuple.
+    # secondary_latency_ms and queue_wait_ms are timing fields that
+    # legitimately differ between two runs of the same logical
+    # comparison. Exclude them from duplicate-detection; the persisted
+    # row stores secondary_latency_ms but it is not part of the
+    # comparison's identity.
+    TIMING_KEYS = {"secondary_latency_ms", "queue_wait_ms"}
     keys = (
         "comparison_id",
         "run_id",
@@ -645,6 +670,8 @@ def _row_payload_matches(row: sqlite3.Row, payload: tuple) -> bool:
     if len(keys) != len(payload):
         return False
     for key, new_value in zip(keys, payload):
+        if key in TIMING_KEYS:
+            continue
         old_value = stored.get(key)
         # JSON list columns: payload holds JSON-encoded strings; stored
         # holds decoded lists. Compare semantically.
