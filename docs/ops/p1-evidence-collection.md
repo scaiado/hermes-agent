@@ -39,10 +39,10 @@ These guarantees are enforced in code and tested in
 2. **Fuli results never enter the live response.** A unit test
    injects a recognisable Fuli marker string and asserts the marker
    never appears in the returned primary payload.
-3. **Fuli's latency does not delay the primary beyond
-   `comparison_budget_ms` (default 250 ms).** A worker thread
-   performs the Fuli call; the primary is returned immediately. A
-   hard wall-clock cap is enforced via `thread.join(timeout=...)`.
+3. **Fuli's latency does not delay the primary.** The sampled-read
+   comparison runs entirely off the request path on a bounded
+   background executor; the foreground returns the primary
+   immediately. See the precise guarantee below.
 4. **Comparison failure does not fail the user request.** All
    exceptions in the comparison path are caught; the row is recorded
    with `secondary_status="failed"` and a `secondary_error_category`.
@@ -62,6 +62,104 @@ These guarantees are enforced in code and tested in
 10. **Comparison accounting is balanced.** Every persisted comparison
     has a recorded primary and secondary status. Drift would be
     visible in the `comparison_accounting()` summary.
+
+## Precise foreground guarantee
+
+After Honcho completes, Hermes enqueues an immutable comparison
+job and returns the Honcho response without waiting for Fuli
+execution or persistence.
+
+Measured on the dedicated executor test fixture
+(`tests/pilot/test_comparison_executor.py`):
+
+- **Foreground enqueue overhead** (target): p50 < 2 ms, p95 < 10 ms,
+  absolute max < 25 ms.
+- **Queue wait latency**: time the job sits in the comparison queue
+  before a worker picks it up.
+- **Fuli execution latency**: the wall-clock duration of the
+  synchronous Fuli call inside the background worker.
+- **Persistence latency**: the wall-clock duration of the SQLite
+  write inside the persistence worker.
+
+These four latencies are observed end-to-end and surfaced via
+`ComparisonExecutor.accounting()`. They are independent of each
+other and of the foreground enqueue overhead.
+
+### Boundedness
+
+The executor owns one fixed-size comparison pool (default 1
+worker) and one single persistence worker. Total outstanding jobs
+is bounded by `max_queue_size + max_workers` (default 1024 + 1
+= 1025 in flight at once across both queues). The comparison queue
+uses `queue.Queue.put_nowait`; a full queue increments
+`comparison_jobs_dropped_queue_full` and returns False. Queue-full
+never affects the primary response.
+
+### Known inability to forcibly terminate Python threads
+
+Python cannot forcibly terminate a running thread. If the Fuli
+bridge fails to honor its own per-call timeout, the comparison
+worker stays blocked on the Fuli call. Other workers and the
+foreground are unaffected. The blocked worker is observed via
+`comparison_jobs_orphaned` (a comparison worker blocked for more
+than `comparison_budget_ms + ORPHAN_GRACE_SECONDS`).
+
+### Cancellation semantics
+
+The comparison worker uses `ThreadPoolExecutor` with a fixed
+worker count; `cancel_futures=True` cancels pending comparison
+futures (only used in error paths; the normal teardown waits for
+in-flight comparisons to finish). The persistence worker is a
+plain `threading.Thread(daemon=True)` whose infinite loop exits
+when the executor's `_stop_event` is set. A daemon thread is
+reaped at interpreter shutdown.
+
+### Flush semantics
+
+`flush(timeout_seconds=...)` waits for:
+
+1. All comparison futures to finish (each future waits up to the
+   remaining deadline).
+2. The persistence queue to drain.
+3. In-flight persistence writes to terminate (every
+   `persistence_started` has a matching
+   `persistence_succeeded + persistence_failed`).
+
+Flush does NOT stop accepting new jobs. Only `teardown()` (the
+executor lifecycle's terminate step) does.
+
+### Teardown semantics
+
+The six-step teardown (in order):
+
+1. `accepting=False` — no new comparison jobs accepted.
+2. The comparison pool is finalized with `wait=True,
+   cancel_futures=False` so all submitted comparisons finish.
+3. `flush()` — drain the persistence queue.
+4. `_stop_event.set()` — signal the persistence worker to exit.
+5. `_persistence_thread.join(timeout=...)` — wait for the
+   persistence worker to actually exit.
+6. `_stopped=True` — the executor is now teardown-completed.
+
+Idle comparison workers and the idle persistence worker can
+exit promptly because they poll `queue.get(timeout=0.1)` and
+check `_stop_event` between iterations.
+
+### Accounting invariants
+
+`is_balanced()` returns True iff:
+
+- `sampled == enqueued + dropped_queue_full` (every sampled
+  query is either enqueued or dropped)
+- `enqueued == started + pending` (every enqueued job is either
+  started or still queued)
+- `started == completed + timed_out + failed` (every started job
+  finishes in one of those three ways)
+- `completed + timed_out == persisted` (every comparison that
+  produced a result is persisted)
+
+A `False` return indicates drift; the executor's accounting
+counters are the source of truth.
 
 ## Data model
 
