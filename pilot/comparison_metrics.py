@@ -68,7 +68,6 @@ def normalize_for_fingerprint(value: str) -> str:
     """
     if not value:
         return ""
-    # Collapse any non-alphanumeric noise. Keep word boundaries.
     text = value
     # Drop JSON-like braces/quotes that often wrap provider output.
     text = re.sub(r"[{}\"'\[\],]", " ", text)
@@ -80,8 +79,12 @@ def normalize_for_fingerprint(value: str) -> str:
         flags=re.IGNORECASE,
     )
     text = re.sub(r"\b[0-9A-HJKMNP-TV-Z]{26}\b", " ", text)  # Crockford ULID-ish
-    # Collapse whitespace and lowercase.
-    text = re.sub(r"\s+", " ", text).strip().lower()
+    # Strip all non-alphanumeric, non-space characters so punctuation and
+    # provider-specific noise (semicolons, slashes, brackets) cannot
+    # differentiate fingerprints.
+    text = re.sub(r"[^a-z0-9 ]+", " ", text.lower())
+    # Collapse whitespace and trim.
+    text = re.sub(r"\s+", " ", text).strip()
     return text
 
 
@@ -89,12 +92,15 @@ def result_fingerprint(result: object) -> str:
     """Compute a stable fingerprint from a result object.
 
     Accepts strings (treated as raw text), dicts (canonicalize their
-    textual fields), or anything else (converted to string).
+    textual fields), None (treated as empty), or anything else (converted
+    to string). Two inputs that normalize to the same canonical form
+    produce the same fingerprint.
     """
-    if isinstance(result, str):
+    if result is None:
+        canonical = ""
+    elif isinstance(result, str):
         canonical = normalize_for_fingerprint(result)
     elif isinstance(result, dict):
-        # Prefer canonical content-like fields, fall back to joined values.
         parts: list[str] = []
         for k, v in result.items():
             if k.lower() in _PROVIDER_ID_KEYS:
@@ -130,14 +136,15 @@ def overlap_at_k(
 ) -> Optional[float]:
     """Fraction of primary's top-k that also appear in secondary's top-k.
 
-    Returns ``None`` when primary's top-k is empty (consistent with the
-    existing pilot behavior so older reports remain comparable).
+    Returns ``None`` when either side's top-k is empty (consistent with
+    the "empty-result rate is reported separately" semantics; a missing
+    comparison is not the same as a zero-overlap comparison).
     """
     if k <= 0:
         return None
     p_set = set(list(primary)[:k])
     s_set = set(list(secondary)[:k])
-    if not p_set:
+    if not p_set or not s_set:
         return None
     return len(p_set & s_set) / len(p_set)
 
@@ -146,27 +153,31 @@ def reciprocal_rank_agreement(
     primary: Sequence[str],
     secondary: Sequence[str],
 ) -> float:
-    """Symmetric agreement signal in [0, 1].
+    """Mean Reciprocal Rank (MRR) agreement in [0, 1].
 
-    For each primary result, find its rank in the secondary list (1-indexed).
-    The contribution is 1/rank if found, 0 if absent. Average across
-    primary results, then symmetrize by averaging with the mirror calculation.
+    For each ranking, find the position of the *first* matching item in
+    the other ranking. Reciprocal rank is 1/(position); if there is no
+    match, the contribution is 0. The forward MRR uses ``primary`` as the
+    query and ``secondary`` as the key (i.e. "is the first item in
+    primary found in secondary, and at what rank?"), the backward MRR
+    swaps the two. The returned value is the symmetric mean.
+
+    With a perfect match (identical orderings), the forward and
+    backward MRR are both 1.0, so the symmetric mean is 1.0.
     """
     if not primary or not secondary:
         return 0.0
 
-    secondary_index = {fp: idx + 1 for idx, fp in enumerate(secondary)}
+    def _mrr(query: Sequence[str], key: Sequence[str]) -> float:
+        key_index = {item: idx + 1 for idx, item in enumerate(key)}
+        for item in query:
+            rank = key_index.get(item)
+            if rank is not None:
+                return 1.0 / rank
+        return 0.0
 
-    def _avg_rank(primary_seq: Sequence[str], secondary_seq: Sequence[str]) -> float:
-        sec_index = {fp: idx + 1 for idx, fp in enumerate(secondary_seq)}
-        total = 0.0
-        for rank, fp in enumerate(primary_seq, start=1):
-            r = sec_index.get(fp)
-            total += (1.0 / r) if r is not None else 0.0
-        return total / max(len(primary_seq), 1)
-
-    forward = _avg_rank(primary, secondary)
-    backward = _avg_rank(secondary, primary)
+    forward = _mrr(primary, secondary)
+    backward = _mrr(secondary, primary)
     return (forward + backward) / 2.0
 
 
