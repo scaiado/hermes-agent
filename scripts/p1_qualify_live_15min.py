@@ -372,8 +372,12 @@ class QualRun:
         self.report["is_balanced"] = shadow.executor_is_balanced()
 
         # ---- Run-scoped rows ----
+        # IMPORTANT: content_captured MUST be in the SELECT so the
+        # privacy gate below can evaluate it. The earlier driver
+        # silently dropped this column and the False branch tripped
+        # against None, which is the parent of the v4 NO-GO.
         all_rows = self.run_sql(
-            "SELECT comparison_id, run_id, namespace, "
+            "SELECT comparison_id, run_id, namespace, content_captured, "
             "secondary_status, secondary_error_category, secondary_latency_ms "
             "FROM comparisons WHERE run_id = ? ORDER BY timestamp",
             (self.run_id,),
