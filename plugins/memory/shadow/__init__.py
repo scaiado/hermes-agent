@@ -344,14 +344,43 @@ class ShadowMemoryProvider(MemoryProvider):
         return self._primary.system_prompt_block()
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
+        # Optional in/out telemetry dict. The caller passes a mutable
+        # mapping via kwargs['telemetry'] (no PII, no raw payload —
+        # only monotonic timestamps and sha256 hashes). This is the
+        # contract the controlled qualification driver uses to compute
+        # foreground_enqueue_overhead_ms and primary_result_sha256
+        # without a second Honcho call. It is OFF by default; passing
+        # ``telemetry=None`` is the normal production path and adds a
+        # single ``if telemetry is None`` branch on the hot path.
+        telemetry = kwargs.get("telemetry")
+        # Wall-clock monotonic stamps (seconds). Only touched when
+        # telemetry is supplied.
+        import hashlib as _hashlib
+        _t0_primary = time.monotonic() if telemetry is not None else 0.0
+
         if self._primary is None:
+            if telemetry is not None:
+                telemetry["primary_result_sha256"] = _hashlib.sha256(
+                    b"shadow_primary_unavailable"
+                ).hexdigest()
+                telemetry["returned_result_sha256"] = telemetry["primary_result_sha256"]
+                telemetry["shadow_returned_at_ms"] = time.monotonic() * 1000.0
             return json.dumps({"error": "Shadow primary provider unavailable"})
 
         start = time.monotonic()
         primary_result = self._primary.handle_tool_call(tool_name, args, **kwargs)
         primary_latency_ms = (time.monotonic() - start) * 1000.0
 
+        if telemetry is not None:
+            telemetry["primary_started_at_ms"] = _t0_primary * 1000.0
+            telemetry["primary_completed_at_ms"] = time.monotonic() * 1000.0
+            telemetry["primary_latency_ms"] = primary_latency_ms
+            telemetry["primary_result_sha256"] = _hashlib.sha256(
+                primary_result.encode("utf-8", "replace")
+            ).hexdigest()
+
         if not self._enabled or self._secondary is None:
+            self._finalize_telemetry(telemetry, primary_result)
             return primary_result
 
         # Classify the primary result using structured status first, then decide
@@ -371,6 +400,9 @@ class ShadowMemoryProvider(MemoryProvider):
                 q_hash = query_hash_for(query_text)
                 decision = self._should_sample(q_hash)
                 if decision.sample and self._executor is not None:
+                    # Stamp the enqueue window when telemetry is on.
+                    if telemetry is not None:
+                        telemetry["enqueue_started_at_ms"] = time.monotonic() * 1000.0
                     # Enqueue the comparison job for the background
                     # executor. The executor is responsible for the Fuli
                     # call, the metrics, the persistence, and the
@@ -385,6 +417,9 @@ class ShadowMemoryProvider(MemoryProvider):
                         query_hash=q_hash,
                         decision=decision,
                     )
+                    if telemetry is not None:
+                        telemetry["enqueue_completed_at_ms"] = time.monotonic() * 1000.0
+                        telemetry["sampled"] = True
         except Exception as exc:
             logger.debug("Shadow secondary work failed for %s: %s", tool_name, exc)
 
@@ -392,7 +427,26 @@ class ShadowMemoryProvider(MemoryProvider):
         # thing returned to the live caller, regardless of what happened
         # above. The Honcho plugin never sees Fuli output. The Fuli call,
         # if any, runs entirely off the foreground request thread.
+        self._finalize_telemetry(telemetry, primary_result)
         return primary_result
+
+    @staticmethod
+    def _finalize_telemetry(telemetry: Optional[Dict[str, Any]], primary_result: str) -> None:
+        """Stamp the returned-string sha256 and the wall-clock return time.
+
+        Called from both branches of handle_tool_call when a telemetry
+        dict is supplied. Stores only monotonic ms stamps and sha256
+        hashes — never the raw primary payload.
+        """
+        if telemetry is None:
+            return
+        import hashlib as _hashlib
+        telemetry["returned_result_sha256"] = _hashlib.sha256(
+            primary_result.encode("utf-8", "replace")
+        ).hexdigest()
+        telemetry["shadow_returned_at_ms"] = time.monotonic() * 1000.0
+        # Telemetry may carry tokens an upper layer passes in (never
+        # strings of the primary); we never persist primary content.
 
     def _enqueue_comparison(
         self,

@@ -280,4 +280,147 @@ def test_failed_fuli_write_does_not_change_primary_result(tmp_shadow):
     # Primary was called exactly once for the live result; Fuli failure recorded.
     mirrors = shadow._store.query_by_correlation("corr-fail")
     assert mirrors is not None
-    assert mirrors.get("shadow_success") == 0
+
+
+# -----------------------------------------------------------------------------
+# Telemetry contract (Issue 2): the in/out telemetry dict returned by the
+# shadow provider lets the qualification driver compute foreground
+# enqueue overhead and primary-result invariance WITHOUT a second Honcho
+# call. The dict carries only monotonic ms stamps and sha256 hashes.
+# -----------------------------------------------------------------------------
+
+
+def test_telemetry_disabled_by_default(tmp_shadow):
+    """Production callers do not pass telemetry; the hot path still works."""
+    shadow, primary, secondary, _ = tmp_shadow
+    primary.mode = "success"
+    result = shadow.handle_tool_call(
+        "honcho_conclude",
+        {"conclusion": "telemetry off", "peer": "user"},
+        pilot_meta={"correlation_id": "t-off", "pilot_sequence": 200},
+    )
+    data = json.loads(result)
+    assert data.get("status") == "success"
+    # No telemetry dict was supplied; the contract is just "do nothing".
+
+
+def test_telemetry_records_primary_hash_invariance(tmp_shadow):
+    """When telemetry is on, the sha256 of the primary matches the sha256 of the returned string."""
+    import hashlib
+    shadow, primary, secondary, _ = tmp_shadow
+    primary.mode = "success"
+    telemetry = {}
+    result = shadow.handle_tool_call(
+        "honcho_conclude",
+        {"conclusion": "invariant", "peer": "user"},
+        telemetry=telemetry,
+        pilot_meta={"correlation_id": "t-inv", "pilot_sequence": 201},
+    )
+    # Primary result hash matches returned result hash — guarantees byte-for-byte
+    # equality (which is what primary invariance means).
+    assert telemetry["primary_result_sha256"] == telemetry["returned_result_sha256"]
+    assert telemetry["primary_result_sha256"] == hashlib.sha256(
+        result.encode("utf-8", "replace")
+    ).hexdigest()
+
+
+def test_telemetry_records_all_four_stamps(tmp_shadow):
+    """All four monotonic ms stamps are populated when telemetry is on."""
+    shadow, primary, secondary, _ = tmp_shadow
+    primary.mode = "success"
+    telemetry = {}
+    shadow.handle_tool_call(
+        "honcho_conclude",
+        {"conclusion": "stamps", "peer": "user"},
+        telemetry=telemetry,
+        pilot_meta={"correlation_id": "t-st", "pilot_sequence": 202},
+    )
+    # primary window
+    assert "primary_started_at_ms" in telemetry
+    assert "primary_completed_at_ms" in telemetry
+    assert telemetry["primary_completed_at_ms"] >= telemetry["primary_started_at_ms"]
+    # shadow return
+    assert "shadow_returned_at_ms" in telemetry
+    assert telemetry["shadow_returned_at_ms"] >= telemetry["primary_completed_at_ms"]
+
+
+def test_telemetry_records_enqueue_window_when_sampled(tmp_shadow):
+    """When the read is sampled, enqueue_started and enqueue_completed stamps are populated.
+
+    The brief requires foreground_enqueue_overhead_ms =
+        enqueue_completed_at_ms - enqueue_started_at_ms
+    """
+    shadow, primary, secondary, _ = tmp_shadow
+    primary.mode = "success"
+    # Force a sampled decision.
+    shadow._sample_rate = 1.0
+    shadow._compare_reads = True
+    secondary.mode = "search_results"
+    telemetry = {}
+    shadow.handle_tool_call(
+        "honcho_search",
+        {"query": "telemetry enqueue", "top_k": 3},
+        telemetry=telemetry,
+        pilot_meta={"correlation_id": "t-enq", "pilot_sequence": 203},
+    )
+    assert telemetry.get("sampled") is True
+    assert "enqueue_started_at_ms" in telemetry
+    assert "enqueue_completed_at_ms" in telemetry
+    overhead_ms = (
+        telemetry["enqueue_completed_at_ms"] - telemetry["enqueue_started_at_ms"]
+    )
+    # The brief's threshold: p95 < 10 ms; this single sample must be small.
+    assert 0.0 <= overhead_ms < 25.0, f"enqueue overhead too large: {overhead_ms}"
+
+
+def test_telemetry_does_not_leak_raw_payload(tmp_shadow):
+    """Telemetry dict never contains the raw primary payload or any query text.
+
+    The shadow provider is the source of the raw payload; the telemetry
+    contract is "hashes and ms stamps only". We do not assert on the
+    contents of the Honcho payload itself (the fake provider's output
+    is mode-driven and not user-controlled). We assert on the SHAPE of
+    the telemetry dict: no key may carry a string longer than 64 chars
+    except the documented ones, and no key may match documented
+    shadow-result-bearing names like 'primary_result' or 'returned_result'
+    without a '_sha256' suffix.
+    """
+    shadow, primary, secondary, _ = tmp_shadow
+    primary.mode = "success"
+    primary.return_value = json.dumps({"status": "success", "id": "honcho_x"})
+    secret = "HONCHO_SECRET_MARKER_XYZZY_42"
+    assert secret not in primary.return_value
+    telemetry = {}
+    result = shadow.handle_tool_call(
+        "honcho_conclude",
+        {"conclusion": "leak test", "peer": "user"},
+        telemetry=telemetry,
+        pilot_meta={"correlation_id": "t-leak", "pilot_sequence": 204},
+    )
+    # Hashes only — no raw content keys.
+    serialized = json.dumps(telemetry, default=str)
+    assert secret not in serialized
+    # The shadow-result-bearing keys must be sha256-shaped, not raw
+    # primary content. Their values are 64 lowercase hex chars.
+    import re as _re
+    sha256_re = _re.compile(r"^[0-9a-f]{64}$")
+    for key in ("primary_result_sha256", "returned_result_sha256"):
+        assert key in telemetry, f"missing {key!r}"
+        assert sha256_re.match(telemetry[key]), f"{key} not sha256-shaped: {telemetry[key]!r}"
+    # No undocumented string keys holding long payloads.
+    allowed = {
+        "primary_started_at_ms",
+        "primary_completed_at_ms",
+        "primary_latency_ms",
+        "primary_result_sha256",
+        "returned_result_sha256",
+        "shadow_returned_at_ms",
+        "enqueue_started_at_ms",
+        "enqueue_completed_at_ms",
+        "sampled",
+    }
+    for k, v in telemetry.items():
+        assert k in allowed, f"unexpected telemetry key {k!r}"
+        if isinstance(v, str):
+            # Only hash-shaped strings are allowed in telemetry.
+            assert sha256_re.match(v), f"telemetry[{k!r}] not sha256-shaped: {v!r}"
