@@ -54,7 +54,7 @@ def cmd_shadow(args: argparse.Namespace) -> None:
     else:
         print(f"Error: unknown shadow subcommand: {sub!r}", file=sys.stderr)
         print(
-            "Available: preflight, status, report, validate-report, cleanup",
+            "Available: preflight, status, report, validate-report, cleanup, disagreements",
             file=sys.stderr,
         )
         sys.exit(1)

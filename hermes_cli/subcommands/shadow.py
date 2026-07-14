@@ -6,6 +6,7 @@ Provides real, distinct subcommands for the Hermes ↔ Fuli shadow pilot:
 
 from __future__ import annotations
 
+import argparse
 from typing import Callable
 
 
@@ -52,4 +53,11 @@ def build_shadow_parser(subparsers, *, cmd_shadow: Callable) -> None:
         action="store_true",
         help="Actually perform deletion",
     )
+    # New disagreements subcommand tree. Lazy-imported to keep ``--help`` fast.
+    from hermes_cli.subcommands.disagreements import build_disagreements_parser
+    from hermes_cli.shadow_disagreements import cmd_disagreements as _cmd_disagreements
+
+    # The disagreements subparser sets ``func=cmd_disagreements`` directly, so
+    # argparse will invoke it on parse. No bridging needed.
+    build_disagreements_parser(shadow_sub, cmd_disagreements=_cmd_disagreements)
     shadow_parser.set_defaults(func=cmd_shadow)
