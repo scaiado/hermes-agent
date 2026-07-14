@@ -337,6 +337,111 @@ def test_fuli_timeout_produces_one_persisted_timeout_row(tmp_path: Path):
         ex.shutdown()
 
 
+def test_is_timeout_error_classifies_common_envelopes():
+    """The dedicated matcher recognizes every documented Fuli timeout envelope."""
+    from pilot.comparison_executor import _is_timeout_error
+
+    # True positives: the noun ("timeout"), the verb ("timed out"),
+    # the Fuli-pinned postfix envelope, the deadline-exceeded form,
+    # and the original case-folded variant.
+    for category in [
+        "timeout",
+        "timeout_after_2000ms",
+        "timed out",
+        "Fuli call timed out after 2.0s",
+        "deadline exceeded",
+        "FULI TIMEOUT",
+        "Deadline_Exceeded",
+        "secondary_error: Timed out",
+    ]:
+        assert _is_timeout_error(category) is True, f"expected True for {category!r}"
+
+    # Non-positive cases.
+    assert _is_timeout_error(None) is False
+    assert _is_timeout_error("") is False
+    assert _is_timeout_error("rate limit exceeded") is False
+    assert _is_timeout_error("internal server error") is False
+    assert _is_timeout_error("secondary_error: permission denied") is False
+
+
+def test_is_timeout_error_does_not_match_generic_failure(tmp_path: Path):
+    """A genuine non-timeout Fuli failure must NOT be classified as a timeout."""
+    from pilot.comparison_executor import _is_timeout_error
+
+    # The actual envelope Fuli returns when it raises inside the
+    # async bridge (not a timeout). The matcher must return False.
+    assert _is_timeout_error(
+        "secondary_error: RuntimeError('Fuli call failed: status=500')"
+    ) is False
+
+
+def test_real_fuli_timed_out_envelope_classifies_as_timeout(tmp_path: Path):
+    """The verbatim Fuli envelope from the live RTX run classifies as timeout,
+    increments comparison_jobs_timed_out (NOT failed), and persists one row."""
+    def fuli_timed_out(name, args, **kw):
+        # Exactly the envelope Fuli's bridge returns on the 2s ceiling.
+        return json.dumps({"error": "Fuli call timed out after 2.0s"})
+
+    ex, store = _make_executor(
+        tmp_path, comparison_budget_ms=100, secondary_call=fuli_timed_out
+    )
+    try:
+        ex.enqueue(_make_job(query_hash="q-fuli-timeout-real"))
+        ex.flush(timeout_seconds=5.0)
+        rows = store.list_comparisons(limit=5)
+        assert len(rows) == 1
+        acc = ex.accounting()
+        # The row exists with the failed status the writer assigns,
+        # and the accounting is the timeout bucket (not generic failed).
+        assert rows[0]["secondary_status"] == "failed"
+        assert acc["comparison_jobs_timed_out"] == 1
+        assert acc["comparison_jobs_failed"] == 0
+        assert acc["comparison_jobs_completed"] == 0
+        assert acc["comparison_jobs_persisted"] == 1
+        assert ex.is_balanced(), f"accounting not balanced: {acc}"
+    finally:
+        ex.shutdown()
+
+
+def test_real_fuli_deadline_exceeded_envelope_classifies_as_timeout(tmp_path: Path):
+    """Deadline-exceeded envelopes also route to the timeout bucket."""
+    def fuli_deadline(name, args, **kw):
+        return json.dumps({"error": "Deadline Exceeded"})
+
+    ex, _ = _make_executor(
+        tmp_path, comparison_budget_ms=100, secondary_call=fuli_deadline
+    )
+    try:
+        ex.enqueue(_make_job(query_hash="q-fuli-deadline"))
+        ex.flush(timeout_seconds=5.0)
+        acc = ex.accounting()
+        assert acc["comparison_jobs_timed_out"] == 1
+        assert acc["comparison_jobs_failed"] == 0
+        assert ex.is_balanced(), f"accounting not balanced: {acc}"
+    finally:
+        ex.shutdown()
+
+
+def test_generic_secondary_error_does_not_increment_timed_out(tmp_path: Path):
+    """A non-timeout Fuli error stays in the failed bucket."""
+    def fuli_other(name, args, **kw):
+        return json.dumps({"error": "permission denied"})
+
+    ex, _ = _make_executor(
+        tmp_path, comparison_budget_ms=100, secondary_call=fuli_other
+    )
+    try:
+        ex.enqueue(_make_job(query_hash="q-fuli-other"))
+        ex.flush(timeout_seconds=5.0)
+        acc = ex.accounting()
+        assert acc["comparison_jobs_timed_out"] == 0
+        assert acc["comparison_jobs_failed"] == 1
+        assert acc["comparison_jobs_completed"] == 0
+        assert ex.is_balanced(), f"accounting not balanced: {acc}"
+    finally:
+        ex.shutdown()
+
+
 def test_late_fuli_completion_cannot_produce_a_second_row(tmp_path: Path):
     """A Fuli call that fails fast AND late produces only one row."""
     call_count = {"n": 0}

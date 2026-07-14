@@ -145,6 +145,34 @@ class ComparisonJob:
         return (now_monotonic or time.monotonic()) - self.enqueued_at_monotonic
 
 
+def _is_timeout_error(category: Optional[str]) -> bool:
+    """Return True iff ``category`` describes a secondary-side timeout.
+
+    The matcher is normalize-then-substring: it lowercases, replaces
+    underscores with spaces, and collapses internal whitespace so the
+    common envelope variations all collapse to a stable form. It
+    recognizes:
+
+      - "timeout"           (noun used by most error envelopes)
+      - "timed out"         (verb used by Fuli: "Fuli call timed
+                             out after 2.0s")
+      - "deadline exceeded"  (Fuli async-bridge fallback under load)
+
+    The previous substring-only check ``"timeout" in category``
+    case-folded only the LHS, so a Fuli envelope of the form
+    "Fuli call timed out after 2.0s" was misclassified as a
+    generic failure. This helper fixes that class of bug.
+    """
+    if not category:
+        return False
+    normalized = " ".join(category.lower().replace("_", " ").split())
+    return (
+        "timeout" in normalized
+        or "timed out" in normalized
+        or "deadline exceeded" in normalized
+    )
+
+
 class ComparisonExecutor:
     """Bounded background executor for sampled-read comparisons.
 
@@ -368,7 +396,7 @@ class ComparisonExecutor:
             comparison.content_captured = False
 
             with self._lock:
-                if secondary_error_category and "timeout" in secondary_error_category.lower():
+                if _is_timeout_error(secondary_error_category):
                     self._jobs_timed_out += 1
                 elif secondary_error_category:
                     self._jobs_failed += 1
