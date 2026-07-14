@@ -420,7 +420,7 @@ def test_empty_comparison_persisted_with_correct_overlap(store: ComparisonStore)
     rec = _make_record(
         primary_fps=[], secondary_fps=[], namespace="hermes:shadow-pilot"
     )
-    rec_id = store.record_comparison(rec)
+    rec_id = store.record_comparison(rec)["comparison_id"]
     persisted = store.get_comparison(rec_id)
     assert persisted["overlap_at_1"] is None
     assert persisted["overlap_at_3"] is None
@@ -438,7 +438,7 @@ def test_comparison_persistence_roundtrip(store: ComparisonStore):
         secondary_fps=["a", "x", "y"],
         query_hash="persistence-test",
     )
-    rec_id = store.record_comparison(rec)
+    rec_id = store.record_comparison(rec)["comparison_id"]
     persisted = store.get_comparison(rec_id)
     assert persisted is not None
     assert persisted["comparison_id"] == rec_id
@@ -451,19 +451,32 @@ def test_comparison_persistence_roundtrip(store: ComparisonStore):
 # 12. duplicate comparison idempotency
 
 
-def test_duplicate_comparison_idempotent(store: ComparisonStore):
-    """Re-recording the same comparison_id is a no-op (INSERT OR IGNORE)."""
+def test_duplicate_comparison_idempotent_same_payload(store: ComparisonStore):
+    """Re-recording the same comparison_id with the SAME payload returns
+    duplicate_idempotent and the existing row is preserved.
+    """
     rec = _make_record(comparison_id="dup-1", query_hash="dup-hash")
-    rec_id_1 = store.record_comparison(rec)
-    # Modify the in-memory record and re-record the same comparison_id.
-    rec.primary_result_fingerprints = ["different-fp"]
-    rec_id_2 = store.record_comparison(rec)
-    assert rec_id_1 == rec_id_2
-    persisted = store.get_comparison(rec_id_1)
+    res_1 = store.record_comparison(rec)
+    assert res_1["outcome"] == "inserted"
+    res_2 = store.record_comparison(rec)
+    assert res_2["outcome"] == "duplicate_idempotent"
     # First write wins.
-    assert persisted["primary_result_fingerprints"] == [], (
-        "duplicate comparison overwrote the first record — idempotency broken"
-    )
+    persisted = store.get_comparison(res_1["comparison_id"])
+    assert persisted["primary_result_fingerprints"] == []
+
+
+def test_duplicate_comparison_idempotent_different_payload_raises(store: ComparisonStore):
+    """Re-recording the same comparison_id with a DIFFERENT payload
+    raises ComparisonStoreError (no silent overwrites, no silent drops).
+    """
+    rec = _make_record(comparison_id="dup-2", query_hash="dup-2")
+    res_1 = store.record_comparison(rec)
+    assert res_1["outcome"] == "inserted"
+    # Mutate the payload, keep the same comparison_id.
+    rec.primary_result_fingerprints = ["mutated-fp"]
+    with pytest.raises(ComparisonStoreError) as ei:
+        store.record_comparison(rec)
+    assert "unexpected_id_collision" in str(ei.value)
 
 
 # 13. redaction defaults (content_captured=False everywhere)
@@ -472,7 +485,7 @@ def test_duplicate_comparison_idempotent(store: ComparisonStore):
 def test_content_captured_default_false(store: ComparisonStore):
     """The schema's content_captured field is always False on write."""
     rec = _make_record()
-    rec_id = store.record_comparison(rec)
+    rec_id = store.record_comparison(rec)["comparison_id"]
     persisted = store.get_comparison(rec_id)
     assert persisted["content_captured"] is False
 
@@ -520,7 +533,7 @@ def test_export_redacted_omits_raw_content(tmp_path: Path):
             result_fingerprint("user prefers Portuguese in casual talk")
         ],
     )
-    rec_id = store.record_comparison(rec)
+    rec_id = store.record_comparison(rec)["comparison_id"]
     rows = store.export_redacted(limit=10)
     dumped = json.dumps(rows)
     assert "Portuguese in casual conversation" not in dumped
@@ -538,8 +551,8 @@ def test_namespace_isolation(store: ComparisonStore):
     """A comparison in namespace A cannot be confused with namespace B."""
     rec_a = _make_record(namespace="hermes:shadow-pilot", query_hash="ns-a")
     rec_b = _make_record(namespace="hermes:prod", query_hash="ns-b")
-    id_a = store.record_comparison(rec_a)
-    id_b = store.record_comparison(rec_b)
+    id_a = store.record_comparison(rec_a)["comparison_id"]
+    id_b = store.record_comparison(rec_b)["comparison_id"]
     assert store.get_comparison(id_a)["namespace"] == "hermes:shadow-pilot"
     assert store.get_comparison(id_b)["namespace"] == "hermes:prod"
     # Filtering by namespace returns the correct subset.
@@ -554,7 +567,7 @@ def test_namespace_isolation(store: ComparisonStore):
 
 def test_adjudication_create_then_update(store: ComparisonStore):
     rec = _make_record(query_hash="adj-1")
-    rec_id = store.record_comparison(rec)
+    rec_id = store.record_comparison(rec)["comparison_id"]
     out = store.record_adjudication(
         rec_id,
         winner="fuli",
@@ -584,7 +597,7 @@ def test_adjudication_create_then_update(store: ComparisonStore):
 
 def test_classify_changes_query_type(store: ComparisonStore):
     rec = _make_record(query_hash="classify-1", query_type="unclassified")
-    rec_id = store.record_comparison(rec)
+    rec_id = store.record_comparison(rec)["comparison_id"]
     store.record_adjudication(
         rec_id, winner="both", query_type="preference", adjudicator="alice"
     )
@@ -598,7 +611,7 @@ def test_classify_changes_query_type(store: ComparisonStore):
 
 def test_invalid_winner_rejected(store: ComparisonStore):
     rec = _make_record(query_hash="inv-1")
-    rec_id = store.record_comparison(rec)
+    rec_id = store.record_comparison(rec)["comparison_id"]
     with pytest.raises(ComparisonStoreError):
         store.record_adjudication(
             rec_id, winner="bogus", query_type="profile", adjudicator="x"
@@ -607,7 +620,7 @@ def test_invalid_winner_rejected(store: ComparisonStore):
 
 def test_invalid_query_type_rejected(store: ComparisonStore):
     rec = _make_record(query_hash="inv-2")
-    rec_id = store.record_comparison(rec)
+    rec_id = store.record_comparison(rec)["comparison_id"]
     with pytest.raises(ComparisonStoreError):
         store.record_adjudication(
             rec_id, winner="fuli", query_type="bogus", adjudicator="x"
@@ -616,7 +629,7 @@ def test_invalid_query_type_rejected(store: ComparisonStore):
 
 def test_invalid_reason_code_rejected(store: ComparisonStore):
     rec = _make_record(query_hash="inv-3")
-    rec_id = store.record_comparison(rec)
+    rec_id = store.record_comparison(rec)["comparison_id"]
     with pytest.raises(ComparisonStoreError):
         store.record_adjudication(
             rec_id,
@@ -640,7 +653,7 @@ def test_adjudication_on_missing_comparison_rejected(store: ComparisonStore):
 def test_export_redacted_is_safe_to_publish(tmp_path: Path):
     store = ComparisonStore(tmp_path / "comparisons.db")
     rec = _make_record(query_hash="export-test", primary_fps=["x"], secondary_fps=["y"])
-    rec_id = store.record_comparison(rec)
+    rec_id = store.record_comparison(rec)["comparison_id"]
     store.record_adjudication(
         rec_id, winner="fuli", query_type="semantic", reason_code="more_relevant",
         adjudicator="alice", note="fuli surfaced a semantic match"
@@ -686,7 +699,7 @@ def test_comparison_accounting_balanced(store: ComparisonStore):
 
 def test_comparison_accounting_after_adjudication(store: ComparisonStore):
     rec = _make_record(query_hash="adj-acc")
-    rec_id = store.record_comparison(rec)
+    rec_id = store.record_comparison(rec)["comparison_id"]
     store.record_adjudication(
         rec_id, winner="fuli", query_type="profile", adjudicator="alice"
     )
@@ -752,7 +765,7 @@ def test_primary_outage_does_not_block_comparison_writes(tmp_path: Path):
         secondary_status="success",
         primary_error="provider_error",
     )
-    rec_id = store.record_comparison(rec)
+    rec_id = store.record_comparison(rec)["comparison_id"]
     persisted = store.get_comparison(rec_id)
     assert persisted["primary_status"] == "failed"
     assert persisted["primary_error_category"] == "provider_error"
@@ -891,3 +904,253 @@ def test_missing_from_helper():
     b = ["y", "w"]
     assert missing_from(a, b, 5) == ["x", "z"]
     assert missing_from(b, a, 5) == ["w"]
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for the 2026-07-13 empty-comparison_id bug
+# ---------------------------------------------------------------------------
+#
+# The original 41 tests pre-populated comparison_id with valid UUIDs in
+# the helper, so they never exercised the path where a caller passes
+# None/"" and the store has to generate one. The shadow provider's
+# _compare_read passed comparison_id="" and the store's
+# `if record.comparison_id is None` check left the empty string intact,
+# causing all 10 dry-run queries to collide on the same PK and the
+# INSERT OR IGNORE silently dropped 9/10 rows.
+#
+# These tests exercise the construction path end-to-end (the shadow
+# provider, the real _compare_read, the real record_comparison) and
+# pin the new contract: empty/None IDs are auto-generated, real
+# collisions are caught, and the persistence accounting is observable.
+
+
+def test_comparison_record_default_id_is_none():
+    """ComparisonRecord() with no args has comparison_id=None."""
+    rec = ComparisonRecord()
+    assert rec.comparison_id is None
+    assert rec.timestamp is None
+
+
+def test_comparison_record_none_id_receives_uuid_in_store(tmp_path: Path):
+    """record_comparison generates a UUID when comparison_id is None."""
+    store = ComparisonStore(tmp_path / "c.db")
+    rec = ComparisonRecord(query_hash="qh", namespace="hermes:shadow-pilot")
+    assert rec.comparison_id is None
+    res = store.record_comparison(rec)
+    assert res["outcome"] == "inserted"
+    assert res["comparison_id"]
+    assert len(res["comparison_id"]) >= 32  # UUID4 hex length
+    # The in-memory record was also stamped.
+    assert rec.comparison_id == res["comparison_id"]
+
+
+def test_comparison_record_empty_id_receives_uuid_in_store(tmp_path: Path):
+    """record_comparison generates a UUID when comparison_id is the empty string.
+
+    This is the exact shape the shadow provider's _compare_read was
+    producing before the fix.
+    """
+    store = ComparisonStore(tmp_path / "c.db")
+    rec = ComparisonRecord(
+        comparison_id="",
+        query_hash="qh",
+        namespace="hermes:shadow-pilot",
+    )
+    res = store.record_comparison(rec)
+    assert res["outcome"] == "inserted"
+    # The empty-string id was replaced with a UUID.
+    assert rec.comparison_id
+    assert rec.comparison_id != ""
+    assert rec.comparison_id == res["comparison_id"]
+
+
+def test_ten_independent_comparisons_persist_as_ten_rows(tmp_path: Path):
+    """Ten records with no pre-populated IDs all land as ten distinct rows."""
+    store = ComparisonStore(tmp_path / "c.db")
+    ids = []
+    for i in range(10):
+        rec = ComparisonRecord(query_hash=f"q-{i}", namespace="hermes:shadow-pilot")
+        res = store.record_comparison(rec)
+        assert res["outcome"] == "inserted"
+        ids.append(res["comparison_id"])
+    # All 10 IDs are non-empty, unique, and stored.
+    assert all(ids)
+    assert len(set(ids)) == 10
+    assert store.comparison_count() == 10
+
+
+def test_ten_comparison_ids_all_unique_and_nonempty(tmp_path: Path):
+    """Each generated ID is unique and non-empty (no PK collisions)."""
+    store = ComparisonStore(tmp_path / "c.db")
+    ids = set()
+    for i in range(10):
+        rec = ComparisonRecord(
+            comparison_id="",  # the original buggy shape
+            query_hash=f"q-{i}",
+        )
+        store.record_comparison(rec)
+        assert rec.comparison_id and rec.comparison_id not in ids
+        ids.add(rec.comparison_id)
+    assert len(ids) == 10
+
+
+def test_persistence_accounting_counts_inserted(tmp_path: Path):
+    """Class-level persistence counters increment correctly when the
+    shadow provider's async path is used.
+    """
+    from plugins.memory.shadow import ShadowMemoryProvider
+
+    # Reset the class counters (best-effort; tests may run in any order).
+    ComparisonStore._persistence_started = 0
+    ComparisonStore._persistence_succeeded = 0
+    ComparisonStore._persistence_failed = 0
+    ComparisonStore._persistence_pending = 0
+    ComparisonStore._duplicate_idempotent = 0
+    ComparisonStore._unexpected_collision = 0
+
+    hermes_home = tmp_path
+    (hermes_home / "memories").mkdir(parents=True, exist_ok=True)
+    shadow = ShadowMemoryProvider()
+    shadow._enabled = True
+    shadow._compare_reads = True
+    shadow._sample_rate = 1.0
+    shadow._sampling_seed = 0
+    shadow._comparison_budget_ms = 250
+    shadow._capture_content = False
+    shadow._namespace = "hermes:shadow-pilot"
+    shadow._write_timeout_ms = 10000
+    shadow._comparison_run_id = "p1-acct-2026-07-13"
+    shadow._comparison_store = ComparisonStore(hermes_home / "memories" / "comparisons.db")
+    shadow._hermes_home = str(hermes_home)
+
+    class _P:
+        def handle_tool_call(self, tool, args, **kw):
+            return json.dumps({"results": ["x"]})
+
+    class _S:
+        def handle_tool_call(self, tool, args, **kw):
+            return json.dumps({"results": []})
+
+    shadow._primary = _P()
+    shadow._secondary = _S()
+
+    for i in range(5):
+        shadow.handle_tool_call("honcho_search", {"query": f"q-{i}", "top_k": 1})
+    # Flush so all 5 writes complete.
+    flush = shadow.flush_comparisons(timeout_seconds=5.0)
+    assert flush["flushed"]
+
+    accounting = ComparisonStore.persistence_accounting()
+    assert accounting["persistence_started"] == 5
+    assert accounting["persistence_succeeded"] == 5
+    assert accounting["persistence_failed"] == 0
+    assert accounting["persistence_pending"] == 0
+    assert accounting["duplicate_idempotent"] == 0
+    assert accounting["unexpected_collision"] == 0
+
+
+def test_duplicate_idempotent_increments_duplicate_counter(tmp_path: Path):
+    """Re-recording the same payload bumps duplicate_idempotent, not unexpected_collision."""
+    ComparisonStore._duplicate_idempotent = 0
+    ComparisonStore._unexpected_collision = 0
+    store = ComparisonStore(tmp_path / "c.db")
+    rec = ComparisonRecord(query_hash="dup-q", namespace="hermes:shadow-pilot")
+    res_1 = store.record_comparison(rec)
+    res_2 = store.record_comparison(rec)
+    assert res_1["outcome"] == "inserted"
+    assert res_2["outcome"] == "duplicate_idempotent"
+    accounting = ComparisonStore.persistence_accounting()
+    assert accounting["duplicate_idempotent"] >= 1
+    assert accounting["unexpected_collision"] == 0
+
+
+def test_shadow_provider_ten_queries_persist_ten_rows(tmp_path: Path):
+    """End-to-end: the shadow provider's _compare_read produces 10/10 rows.
+
+    This is the regression test for the original 1/10 dry-run bug. It
+    uses the REAL shadow provider construction path (not a hand-built
+    ComparisonRecord with a pre-populated UUID) so it would have caught
+    the original bug.
+    """
+    from plugins.memory.shadow import ShadowMemoryProvider
+
+    # Construct a provider with sample_rate=1.0 (always sample) against
+    # a temp HERMES_HOME so the comparison store is hermetic.
+    hermes_home = tmp_path
+    (hermes_home / "memories").mkdir(parents=True, exist_ok=True)
+    shadow = ShadowMemoryProvider()
+    shadow._enabled = True
+    shadow._mirror_writes = False
+    shadow._compare_reads = True
+    shadow._sample_rate = 1.0
+    shadow._sampling_seed = 0
+    shadow._comparison_budget_ms = 250
+    shadow._capture_content = False
+    shadow._namespace = "hermes:shadow-pilot"
+    shadow._write_timeout_ms = 10000
+    shadow._comparison_run_id = "p1-regression-2026-07-13"
+    shadow._comparison_store = ComparisonStore(hermes_home / "memories" / "comparisons.db")
+    shadow._hermes_home = str(hermes_home)
+
+    primary_payload = {"results": ["primary-1", "primary-2"]}
+    # The shadow provider expects a primary and secondary provider on
+    # _primary / _secondary. The primary is the one whose return value
+    # the shadow provider forwards. The secondary is the comparison
+    # target. We inject stubs that return deterministic data.
+    class _StubPrimary:
+        def handle_tool_call(self, tool, args, **kw):
+            return json.dumps(primary_payload)
+
+    class _StubSecondary:
+        def handle_tool_call(self, tool, args, **kw):
+            # Simulate the Fuli case where the search times out.
+            return json.dumps({"results": []})
+
+    shadow._primary = _StubPrimary()
+    shadow._secondary = _StubSecondary()
+
+    # Reset counters so this test is hermetic.
+    ComparisonStore._persistence_started = 0
+    ComparisonStore._persistence_succeeded = 0
+    ComparisonStore._persistence_failed = 0
+    ComparisonStore._persistence_pending = 0
+    ComparisonStore._duplicate_idempotent = 0
+    ComparisonStore._unexpected_collision = 0
+
+    queries = [f"regression-q-{i:02d}" for i in range(10)]
+    primary_results = []
+    for q in queries:
+        out = shadow.handle_tool_call("honcho_search", {"query": q, "top_k": 3})
+        primary_results.append(out)
+    # CRITICAL: this is the regression. Flush the async threads, then
+    # assert 10 rows persisted. time.sleep(1.0) alone is what the dry-run
+    # relied on, and it was insufficient on the previous run.
+    flush_result = shadow.flush_comparisons(timeout_seconds=5.0)
+    assert flush_result["flushed"], (
+        f"flush_comparisons did not complete: {flush_result}"
+    )
+
+    rows = shadow._comparison_store.list_comparisons(limit=50)
+    assert len(rows) == 10, (
+        f"expected 10 rows after fix, got {len(rows)} — empty-collision "
+        f"regression has resurfaced. Persist accounting: "
+        f"{ComparisonStore.persistence_accounting()}"
+    )
+
+    # All 10 comparison_ids are non-empty and unique.
+    ids = [r["comparison_id"] for r in rows]
+    assert all(ids)
+    assert len(set(ids)) == 10
+
+    # The dry-run marker is not in any response (Fuli marker never leaks).
+    for out in primary_results:
+        assert "fuli-leak" not in out.lower()
+
+    # Persistence accounting is balanced.
+    accounting = ComparisonStore.persistence_accounting()
+    assert accounting["persistence_failed"] == 0
+    assert accounting["unexpected_collision"] == 0
+    assert accounting["persistence_pending"] == 0
+    assert accounting["persistence_started"] == 10
+    assert accounting["persistence_succeeded"] == 10
+    assert accounting["duplicate_idempotent"] == 0
