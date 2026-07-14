@@ -368,7 +368,7 @@ class ComparisonExecutor:
             comparison.content_captured = False
 
             with self._lock:
-                if secondary_error_category and "timeout" in secondary_error_category:
+                if secondary_error_category and "timeout" in secondary_error_category.lower():
                     self._jobs_timed_out += 1
                 elif secondary_error_category:
                     self._jobs_failed += 1
@@ -594,7 +594,9 @@ class ComparisonExecutor:
             == a["comparison_jobs_completed"]
             + a["comparison_jobs_timed_out"]
             + a["comparison_jobs_failed"]
-            and a["comparison_jobs_completed"] + a["comparison_jobs_timed_out"]
+            and a["comparison_jobs_completed"]
+            + a["comparison_jobs_timed_out"]
+            + a["comparison_jobs_failed"]
             == a["comparison_jobs_persisted"]
         )
 

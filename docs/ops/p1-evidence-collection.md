@@ -166,8 +166,9 @@ check `_stop_event` between iterations.
   started or still queued)
 - `started == completed + timed_out + failed` (every started job
   finishes in one of those three ways)
-- `completed + timed_out == persisted` (every comparison that
-  produced a result is persisted)
+- `completed + timed_out + failed == persisted` (every terminal
+  job produces exactly one persisted row — successes, Fuli
+  timeouts, and other Fuli errors all persist)
 
 A `False` return indicates drift; the executor's accounting
 counters are the source of truth.
