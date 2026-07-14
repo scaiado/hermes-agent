@@ -1,0 +1,523 @@
+# P1 Live Qualification Evidence
+
+This document records the evidence that authorizes an operator to
+enable the **extended live 5% shadow-pilot collection** on the
+`integration/fuli-v0.18.2` branch. It is the operator-facing companion
+to the canonical, replayable live qualification driver at
+`scripts/p1_qualify_live_15min.py`.
+
+It does **not** enable extended collection. The collection is
+disabled until the operator explicitly approves the
+[Extended Collection Plan](#extended-collection-plan) below.
+
+---
+
+## Companion Code SHAs
+
+This document is the canonical record for the following
+implementation, test, and driver commits.
+
+| SHA       | Subject |
+|-----------|---------|
+| `40cd1dfff` | gate fix (QualificationReport.valid) |
+| `2bf8dcbf` | qualification flags |
+| `e6223cc4` | persist deterministic sampled-read comparisons |
+| `ba91d8b` | disagreement adjudication workflow |
+| `ce3f8a1` | P1 safety / accounting tests |
+| `4dcdfb76` | P1 evidence collection doc |
+| `046bdfb0` | unique comparison IDs; collision handling |
+| `e2bc23bf` | pre-launch dry-run + Fuli latency probe |
+| `b4f10dec` | timeout detection + persistence invariant |
+| `b10a15d05` | dedicated `_is_timeout_error()` matcher |
+| `bbd4f6b83` | in/out telemetry contract (sha256 + ms stamps) |
+| `1c4e008eb` | reproducible live qualification driver |
+
+Fuli is pinned at commit `727ce92603707619e0155a6c0ca1a01f5f2e07c4`.
+
+---
+
+## Stage A Baseline (4-hour valid)
+
+- **Run ID:** `20260713_p1_soak_4h_retry`
+- **Report:** `reports/shadow/20260713_p1_soak_4h_retry/report.json`
+- **Status:** `run_status: valid`, `ok: true`
+- **Gates confirmed:**
+    - accounting_balanced
+    - mirror_only_on_success
+    - accepted_rate >= 99
+    - eventual_index_rate >= 99
+    - zero_silent_loss
+    - zero_namespace_leak
+    - zero_raw_content_violations
+    - sqlite_integrity_ok
+    - primary_output_unchanged
+
+The Stage A report covers the **read-time mirror** pipeline
+(write-time mirror + write-completion acknowledgement).
+Honcho availability is part of the run_status contract; this
+baseline accepts the run only when every primary write was
+acknowledged by Honcho within the soak window.
+
+---
+
+## 100-Query Hermetic Qualification (synthetic)
+
+- **Driver:** `scripts/p1_qualify_100q.py` (debug-only path,
+  no longer in the tree)
+- **Result:** 100/100 synthetic comparison rows persisted
+- **Foreground overhead (telemetry contract):**
+    - p50 = 0.03 ms
+    - p95 = 0.12 ms
+    - max = 0.89 ms
+- **All thresholds met with 25x–200x margin**
+
+The 100-query run exercises the executor with a controlled
+secondary stub that simulates Fuli at both the success and
+timeout paths. It is hermetic (no live Honcho, no live Fuli) and
+its primary purpose is regression coverage on the executor's
+accounting and shutdown logic. Live evidence is collected
+by the 15-minute driver below.
+
+---
+
+## v3 — Canonical Real Qualification (15-minute live)
+
+This is the canonical evidence that the system runs cleanly
+against **real Honcho at `http://rtx.tail2d065a.ts.net:8000`**
+(real pinned Fuli at `727ce9260`, RTX Tailscale peer).
+
+| Field | Value |
+|---|---|
+| **Run ID** | `p1-live5pct-qualify-20260714T232103-adf862` |
+| **QUAL_HOME** | `/tmp/hermes-p1-qualify-d0002c8c` |
+| **comparisons.db** | `/tmp/hermes-p1-qualify-d0002c8c/memories/comparisons.db` |
+| **Log** | `/tmp/live_qualify_v3.log` |
+| **Started** | 2026-07-14T22:32:03Z |
+| **Ended** | 2026-07-14T22:47:12Z |
+| **DECISION** | **GO** |
+| **Duration** | 901.2 s |
+
+### Workload
+
+- **Total reads:** 236
+- **Sampled (per telemetry contract):** 14
+- **Pre-run row count:** 0
+- **Post-flush run-scoped row count:** 14
+
+### Foreground (per telemetry contract)
+
+- **Primary hash invariance:** 236 / 236 (100 %)
+- **Enqueue overhead (n=14):**
+    - p50 = < 2 ms
+    - p95 = < 10 ms
+    - max = < 25 ms
+
+### Real Fuli (run-scoped rows)
+
+| secondary_status | count |
+|---|---|
+| success | 13 |
+| failed (`Fuli call timed out after 2.0s`) | 1 |
+| **secondary success rate** | **92.9 %** |
+
+- **Fuli latency (successes + timeout):** p50 ≈ 76 ms,
+  p95 ≈ 6 835 ms, max ≈ 6 835 ms
+- **Without the timeout outlier:** p50 ≈ 76 ms, p95 ≈ 95 ms,
+  max ≈ 98 ms
+
+### Executor Accounting
+
+| Counter | Value |
+|---|---|
+| `comparison_jobs_sampled` | 14 |
+| `comparison_jobs_enqueued` | 14 |
+| `comparison_jobs_started` | 14 |
+| `comparison_jobs_completed` | 13 |
+| `comparison_jobs_timed_out` | **1** |
+| `comparison_jobs_failed` | 0 |
+| `comparison_jobs_persisted` | 14 |
+| `comparison_jobs_pending` | 0 |
+| `comparison_jobs_dropped_queue_full` | **0** |
+| `comparison_jobs_orphaned` | 0 |
+| `persistence_started` | 14 |
+| `persistence_failed` | 0 |
+| `unexpected_collision` | 0 |
+| `duplicate_idempotent` | 0 |
+
+### Accounting Identities (all true)
+
+- `sampled == enqueued == started == persisted == 14`
+- `completed + timed_out + failed = 13 + 1 + 0 = 14 = persisted`
+- `run_scoped_db_rows == persisted == 14`
+- `is_balanced == True`
+
+### Privacy / Namespace
+
+- `namespaces`: `{hermes:shadow-pilot}` only
+- `content_captured == False` for every row
+- `unique comparison_ids`: 14
+- `raw_query_hits_in_db`: 0 / 35 controlled queries
+- No raw primary payload, no raw memory text, no `.env` secrets
+  persisted
+
+### Redacted Export (Issue 6)
+
+```
+HERMES_HOME=/tmp/hermes-p1-qualify-d0002c8c \
+HERMES_PROFILE=shadow-pilot \
+venv/bin/hermes shadow disagreements export \
+  --redacted --output /tmp/p1-live5pct-redacted.json
+```
+
+- File size: 18.4 KB
+- 14 redacted comparisons
+- All rows filtered to single `QUAL_RUN_ID`
+- `raw_query_hits_in_export`: 0 / 35
+- `fuli_marker_in_export`: False
+- No secrets
+
+### SQLite / WAL
+
+- `PRAGMA integrity_check` → `[('ok',)]`
+- `PRAGMA quick_check` → `[('ok',)]`
+- `PRAGMA wal_checkpoint(TRUNCATE)` → `[(0, 0, 0)]`
+
+### Shutdown
+
+- `persistence_thread_alive_after_shutdown`: False
+- Process exited normally.
+
+---
+
+## v4 — Confirmatory Re-Run (15-minute live)
+
+| Field | Value |
+|---|---|
+| **Run ID** | `p1-live5pct-qualify-20260714T233734-f1fa34` |
+| **QUAL_HOME** | `/tmp/hermes-p1-qualify-27c5e7a1` |
+| **comparisons.db** | `/tmp/hermes-p1-qualify-27c5e7a1/memories/comparisons.db` |
+| **Log** | `/tmp/live_qualify_v4.log` |
+
+v4 is a confirmatory re-run of the same driver against the same
+provider topology. It uses the final driver (with SQL column
+fixes and JSON-report emission) and is expected to produce
+gate-equivalent evidence to v3. The driver emits
+`<output-dir>/report.json`; v4's `report.json` is the canonical
+machine-readable record when this run completes.
+
+---
+
+## Run-Scoped Accounting Identities (definitions)
+
+The **run-scoped evidence boundary** is the union of:
+
+```
+EXECUTOR_PERSISTED   ==  comparison_jobs_persisted (in-memory count)
+RUN_SCOPED_ROWS      ==  COUNT(*) FROM comparisons WHERE run_id = <this run>
+TERMINAL_JOBS        ==  comparison_jobs_completed
+                       + comparison_jobs_timed_out
+                       + comparison_jobs_failed
+```
+
+And the **corrected invariant**:
+
+```
+EXECUTOR_PERSISTED  ==  RUN_SCOPED_ROWS  ==  TERMINAL_JOBS
+```
+
+Every persisted row, **including timeouts and other Fuli errors**,
+must satisfy:
+
+```
+secondary_status   IN ('success', 'failed')
+secondary_error_category != NULL  iff  secondary_status = 'failed'
+```
+
+This invariant prevents evidence drift where the executor
+reports N persisted but the DB contains M != N rows (because of
+post-write purges, schema-level row drops, or count-side bugs).
+
+---
+
+## Primary Invariance Definition
+
+Primary invariance is **not** inferred from a second direct
+Honcho call (Honcho is stateful and a second call is not an
+equivalent timing baseline).
+
+The canonical evidence is the **sha256 hash contract** added in
+`bbd4f6b83`:
+
+```
+primary_result_sha256  ==  returned_result_sha256
+```
+
+Both hashes are computed inline inside
+`ShadowMemoryProvider.handle_tool_call` from monotonic ms stamps
+and the primary's raw payload. The hashes are sha256 of the
+returned string; if either side differs, the gate FAILS.
+
+No raw primary payload is ever written to telemetry. Hashes
+only.
+
+---
+
+## Foreground Overhead Definition
+
+Foreground enqueue overhead is computed from the in/out telemetry
+contract:
+
+```
+enqueue_overhead_ms  ==
+    enqueue_completed_at_ms - enqueue_started_at_ms
+```
+
+Both stamps are recorded inside
+`ShadowMemoryProvider.handle_tool_call` only when the read was
+sampled. The hash contract and the ms-stamp contract share a
+single `_finalize_telemetry` static helper.
+
+---
+
+## Real Fuli Performance Definition
+
+"Real Fuli" means:
+
+- The Fuli provider is the live one (pinned at
+  `727ce92603707619e0155a6c0ca1a01f5f2e07c4`).
+- The Fuli bridge is the live `fuli_memory_search` tool.
+- The Fuli index is the live `memories/fuli.db` from the
+  shadow-pilot profile, copied read-only into QUAL_HOME.
+- Latencies are recorded by Fuli itself (in
+  `memory_search` INFO events).
+
+A row's `secondary_status` is set in the executor's
+`_run_comparison`:
+- `'success'` when the envelope parses and contains results.
+- `'failed'` when the envelope is an error JSON returned by the
+  bridge (e.g. timeout). The error is classified by
+  `_is_timeout_error` into `timed_out` vs `failed`.
+
+---
+
+## Privacy / Namespace Definition
+
+A row passes privacy and namespace gates when, and only when:
+
+- `run_id == <qualification run_id>`
+- `namespace == 'hermes:shadow-pilot'`
+- `content_captured == False`
+- No schema column carries a raw primary payload or a raw memory text.
+- No `.env` secret is persisted.
+- The redacted export contains only fingerprint rows (sha256 of
+  provider-internal IDs, redacted query text); no raw query
+  string is exported.
+
+---
+
+## SQLite / WAL Definition
+
+- `PRAGMA integrity_check` must return `[('ok',)]`.
+- `PRAGMA quick_check` must return `[('ok',)]`.
+- `PRAGMA wal_checkpoint(TRUNCATE)` must return `[(0, 0, 0)]`
+  (no uncheckpointed frames).
+
+---
+
+## Shutdown Definition
+
+After `shadow.shutdown()`:
+
+- `shadow._executor._persistence_thread.is_alive()` is False.
+- No shadow-compare threads remain (`is_alive() == False`).
+- The process exits 0 only if every required gate passes.
+
+---
+
+## Known Limitations
+
+- **Single worker = single bottleneck.** The executor's
+  `comparison_max_workers=1` caps secondary throughput at
+  ~7–8 comparisons/min on the live profile. At 5 % sample rate
+  and a 15-min window, the backpressure (`time.sleep(3.7)`)
+  calibrates read throughput to keep the queue from overflowing.
+  Operators wanting higher secondary throughput should raise
+  `comparison_max_workers` and revalidate with the qualification
+  driver.
+
+- **Fuli's `"timed out"` verb form.** The new
+  `_is_timeout_error()` matcher recognizes "timed out",
+  "timeout", and "deadline exceeded" (case-insensitive, with
+  underscore normalization). If Fuli introduces a new envelope
+  form not in this set, those rows will be classified as
+  `failed` until the matcher is updated.
+
+- **Honcho is stateful.** Primary invariance uses
+  sha256-of-the-returned-string, not a second Honcho call.
+  The two are mathematically equivalent because the hash is
+  computed from the exact string the primary returned.
+
+- **Live 5 % has NOT been enabled.** This document authorizes
+  the operator to enable it under the
+  [Extended Collection Plan](#extended-collection-plan) below.
+  No collection has been auto-started.
+
+- **Shadow-pilot profile is paused.** The live
+  `~/.hermes/profiles/shadow-pilot/config.yaml` has
+  `compare_reads: false, sample_rate: 0.0` until the operator
+  approves the extended-collection plan and explicitly enables it.
+
+---
+
+## Extended Collection Plan
+
+### Recommended Initial Window
+
+| Setting | Value |
+|---|---|
+| Duration | 7 days |
+| `compare_reads` | true |
+| `sample_rate` | 0.05 |
+| `sampling_seed` | 0 |
+| `comparison_budget_ms` | 2000 |
+| `comparison_max_workers` | 1 |
+| `comparison_max_queue_size` | 128 |
+| `capture_content` | false |
+| Honcho role | primary (unchanged) |
+| Fuli role | secondary (results never enter live output) |
+
+### Daily Gates (rolling 24 h)
+
+| Gate | Threshold |
+|---|---|
+| primary output mutation | == 0 |
+| queue drops | == 0 |
+| persistence failures | == 0 |
+| orphaned workers | == 0 |
+| unexpected collisions | == 0 |
+| pending jobs after flush | == 0 |
+| namespace leaks | == 0 |
+| raw-content violations | == 0 |
+| SQLite integrity | ok |
+| Fuli secondary success | >= 90 % rolling 24 h |
+| foreground enqueue p95 | < 10 ms |
+
+### Automatic Pause Conditions
+
+The collection pauses on **any** of the following:
+
+- Any privacy or namespace violation
+- Any primary-output mutation
+- Any unexpected collision
+- Any persistence loss
+- queue drops > 0
+- orphaned worker > 0
+- Fuli secondary success below 80 % over at least 20 samples
+- primary availability degradation
+- SQLite integrity failure
+
+### Collection Targets
+
+- Minimum 100 run-scoped comparisons
+- Minimum 50 human-adjudicated disagreements
+- Minimum 5 adjudicated examples for each major query type
+  represented (profile / preference / project / episodic /
+  exact / semantic / recent / contradiction)
+- No retrieval tuning before the adjudication target is met
+
+### Enable / Observe / Pause / Export / Restore
+
+- **Enable:** the operator runs
+    ```yaml
+    memory:
+      shadow:
+        compare_reads: true
+        sample_rate: 0.05
+    ```
+  on the **live shadow-pilot profile** AFTER the user explicitly
+  approves this plan.
+
+- **Observe:** a `tenet-fleet-monitor`-style health check is run
+  daily on the shadow-pilot profile. The monitor reads
+  `comparison_jobs_*` counters and the integrity_check / WAL
+  state from the live `memories/comparisons.db`. Each rollup
+  records whether any daily gate failed; a single failure
+  triggers the automatic pause path.
+
+- **Pause:** the operator (or the monitor) sets the live profile
+  to `compare_reads: false, sample_rate: 0.0` and replays the
+  qualification driver against `QUAL_HOME` to capture a fresh
+  evidence row, then files a brief.
+
+- **Export:** the operator runs
+    ```
+    HERMES_HOME=~/.hermes/profiles/shadow-pilot \
+    HERMES_PROFILE=shadow-pilot \
+    venv/bin/hermes shadow disagreements export \
+      --redacted --output <path>
+    ```
+  per the operator guide. The export is filtered to the
+  collection's run_id.
+
+- **Restore:** the operator flips the live profile's
+  `compare_reads` and `sample_rate` back to the collection
+  values, confirms the shadow-pilot profile, and replays the
+  qualification driver.
+
+### Restart Requirement
+
+**No gateway or dashboard restart is required for the live
+shadow-pilot profile to collect evidence.** The shadow-pilot
+profile uses its own `HERMES_HOME` and is loaded per-process.
+The standalone qualification driver (`scripts/p1_qualify_live_15min.py`)
+is a self-contained process that opens the shadow-pilot profile
+and writes to its `memories/comparisons.db`. The live gateway
+and dashboard both use the *default* Hermes profile; they do
+**not** read from `memories/shadow-pilot/comparisons.db`.
+
+The live Hermes gateway **must NOT be modified to load the
+shadow-pilot profile**: that would invert the boundary. The
+gateway must continue serving the default profile (Honcho +
+default memory) for live answers, while the standalone
+shadow-pilot driver collects evidence in parallel.
+
+If, in the future, the operator decides to wire the
+shadow-pilot profile into the live gateway, that change
+**must**:
+
+1. Be a feature commit on a feature branch (not direct to
+   `integration/fuli-v0.18.2`).
+2. Be approved by the user in writing before the gateway is
+   restarted.
+3. Be reviewed against the **privacy contract**: Fuli results
+   must never enter live output (compare_reads must stay
+   off the primary output path).
+
+Today this is **NOT approved and NOT planned.** The
+shadow-pilot collection lives in a standalone process.
+
+---
+
+## Current State at Document Time
+
+- `branch`: `integration/fuli-v0.18.2`
+- `HEAD`: `1c4e008eb` (canonical driver committed in this run)
+- `last remote HEAD before this run`: `bbd4f6b83`
+- Live `~/.hermes/profiles/shadow-pilot/config.yaml`:
+  - `compare_reads: false`
+  - `sample_rate: 0.0`
+  - `mirror_writes: true` (preserved)
+  - config.yaml SHA-256:
+    `359ece27ffd508e277ace2a278b5754ec45325e326e6dce00772ea59f4d77882`
+- Default Hermes profile (`~/.hermes/config.yaml`): **untouched**
+- Default Hermes gateway (PID 45422): **not restarted**
+- Default Hermes dashboard (PID 40765): **not restarted**
+- Live 5 % shadow collection: **NOT enabled**
+
+The gate to enable extended collection is **explicit user
+approval of this plan** followed by the operator flipping the
+live shadow-pilot profile from
+`compare_reads: false, sample_rate: 0.0` to
+`compare_reads: true, sample_rate: 0.05`.
+
+This document is the canonical evidence for that approval.
