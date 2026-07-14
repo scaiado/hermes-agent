@@ -95,6 +95,17 @@ uses `queue.Queue.put_nowait`; a full queue increments
 `comparison_jobs_dropped_queue_full` and returns False. Queue-full
 never affects the primary response.
 
+`ThreadPoolExecutor`'s internal work queue is unbounded. This
+implementation remains bounded because every accepted future
+consumes one slot in the explicit bounded comparison queue
+(`max_queue_size`) until the job completes. The persistence
+queue is also currently unbounded but is serially drained by a
+single persistence worker and its maximum observed depth is
+exposed via `executor_accounting()['persistence_queue_depth']` /
+`['queue_high_watermark']`. A run is invalid if the persistence
+queue grows monotonically or does not drain to zero after
+`flush()`.
+
 ### Known inability to forcibly terminate Python threads
 
 Python cannot forcibly terminate a running thread. If the Fuli
