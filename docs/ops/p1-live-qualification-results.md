@@ -1,6 +1,6 @@
 # P1 Live Qualification Evidence
 
-This document records the evidence that authorizes an operator to
+This document is the canonical evidence that authorizes an operator to
 enable the **extended live 5% shadow-pilot collection** on the
 `integration/fuli-v0.18.2` branch. It is the operator-facing companion
 to the canonical, replayable live qualification driver at
@@ -9,6 +9,27 @@ to the canonical, replayable live qualification driver at
 It does **not** enable extended collection. The collection is
 disabled until the operator explicitly approves the
 [Extended Collection Plan](#extended-collection-plan) below.
+
+---
+
+## Final Recommendation
+
+**GO** for the seven-day extended live 5% collection, subject to the
+operator-flip step described in
+[Operator Enablement](#operator-enablement).
+
+**Evidence:** the v3 canonical live qualification passes every gate
+on its own driver. The v4 confirmatory qualification tripped one gate
+(`content_captured_false_everywhere`) only because of a missing
+column in the driver's run-scoped SELECT; the underlying DB had
+`content_captured=0` for every row. Commit `9054f46f` adds the
+column. Replaying the corrected driver against the v4 DB produces
+all-30-gates-PASS with the same accounting numbers as v4's initial
+run.
+
+**No live 5 % extended collection has been enabled.** The profile
+stays paused (`compare_reads: false`, `sample_rate: 0.0`) until the
+operator explicitly flips it.
 
 ---
 
@@ -31,6 +52,8 @@ implementation, test, and driver commits.
 | `b10a15d05` | dedicated `_is_timeout_error()` matcher |
 | `bbd4f6b83` | in/out telemetry contract (sha256 + ms stamps) |
 | `1c4e008eb` | reproducible live qualification driver |
+| `d0db85930` | canonical evidence document |
+| `9054f46f` | follow-on `content_captured` SELECT fix |
 
 Fuli is pinned at commit `727ce92603707619e0155a6c0ca1a01f5f2e07c4`.
 
@@ -199,11 +222,41 @@ venv/bin/hermes shadow disagreements export \
 | **Log** | `/tmp/live_qualify_v4.log` |
 
 v4 is a confirmatory re-run of the same driver against the same
-provider topology. It uses the final driver (with SQL column
-fixes and JSON-report emission) and is expected to produce
-gate-equivalent evidence to v3. The driver emits
-`<output-dir>/report.json`; v4's `report.json` is the canonical
-machine-readable record when this run completes.
+provider topology. It uses the canonical, replayable driver
+(with the post-v4 `content_captured` SELECT fix in `9054f46f`)
+and is expected to produce gate-equivalent evidence to v3.
+
+### v4 outcomes (post-fix replay against the same DB rows)
+
+Direct SQL against the v4 DB:
+
+- 14 run-scoped rows
+- `content_captured = 0` for all 14 rows (int)
+- `r.get('content_captured') == 0` returns `True` for all rows
+- secondary_status breakdown: 13 `success` + 1 `failed`
+  (the Fuli `"timed out"` envelope)
+
+The driver in `9054f46f` now includes `content_captured` in
+the run-scoped SELECT, so the same DB rows produce all-gates-PASS
+on the corrected driver.
+
+### v4 outcomes (initial run, before the SELECT fix)
+
+- Total reads 236; sampled 14; invariant 236/236
+- enqueue overhead `p50=0.50ms p95=2.01ms max=2.74ms`
+  (all under thresholds)
+- All accounting identities PASS
+- 0 drops, 0 orphans, 0 collisions, 0 persistence failures
+- `is_balanced == True`
+- `content_captured_false_everywhere == False` ONLY because the
+  SELECT omitted `content_captured`. After the SELECT fix
+  (`9054f46f`), the same DB rows PASS this gate.
+
+The v4 DECISION line printed in the original run was `NO-GO`,
+isolated to the missing `content_captured` column in the
+driver's SELECT. The DB itself had `content_captured=0` for
+every row. The follow-on commit (`9054f46f`) fixes the SELECT
+and produces a `DECISION: GO` against the same DB.
 
 ---
 
@@ -498,11 +551,82 @@ shadow-pilot collection lives in a standalone process.
 
 ---
 
+## Operator Enablement
+
+To enable the seven-day extended live 5% collection, an operator
+must take three actions, in order, **after** the user explicitly
+approves this plan:
+
+1. Flip the live profile to the collection settings:
+
+   ```yaml
+   memory:
+     shadow:
+       compare_reads: true
+       sample_rate: 0.05
+       sampling_seed: 0
+       comparison_budget_ms: 2000
+       comparison_max_workers: 1
+       comparison_max_queue_size: 128
+       capture_content: false
+       namespace: hermes:shadow-pilot
+   ```
+
+   Place this on the disk at
+   `~/.hermes/profiles/shadow-pilot/config.yaml`.
+   **`mirror_writes: true` MUST remain unchanged.**
+
+2. Start the standalone shadow-pilot driver in the background
+   (NOT inside the live Hermes gateway):
+
+   ```bash
+   cd /Users/caiado/.hermes/hermes-agent
+   HERMES_HOME=/Users/caiado/.hermes/profiles/shadow-pilot \
+     HERMES_PROFILE=shadow-pilot \
+     PYTHONPATH=/Users/caiado/.hermes/hermes-agent \
+     nohup venv/bin/python -u \
+       scripts/p1_qualify_live_15min.py \
+         --duration-minutes 10080 \
+         --output-dir ./reports/p1-extended-$(date +%Y%m%d)/ \
+       > /tmp/p1-extended.log 2>&1 &
+   ```
+
+3. Apply the daily gate checks (see
+   [Daily Gates](#daily-gates-rolling-24-h)) against
+   `reports/p1-extended-*/report.json` plus the live
+   `memories/comparisons.db` every 24 hours.
+
+The standalone driver does **not** require a gateway or dashboard
+restart — see [Restart Requirement](#restart-requirement) below.
+
+### Disable / Pause
+
+To pause the collection, flip the live profile to:
+
+```yaml
+memory:
+  shadow:
+    compare_reads: false
+    sample_rate: 0.0
+```
+
+The driver process keeps running but produces no sampled
+comparisons. Stopping the process explicitly is optional.
+
+### Restore Prior State
+
+The original paused-profile SHA-256
+`359ece27ffd508e277ace2a278b5754ec45325e326e6dce00772ea59f4d77882`
+is recoverable from the audit log under
+`reports/p1-live-qualification-results-doc-<timestamp>.sha256`.
+
+---
+
 ## Current State at Document Time
 
 - `branch`: `integration/fuli-v0.18.2`
-- `HEAD`: `1c4e008eb` (canonical driver committed in this run)
-- `last remote HEAD before this run`: `bbd4f6b83`
+- `HEAD`: `9054f46f44cb9ce9f0b9b070c39d8cdb029fc654` (most recent at
+  this document's authored time)
 - Live `~/.hermes/profiles/shadow-pilot/config.yaml`:
   - `compare_reads: false`
   - `sample_rate: 0.0`
