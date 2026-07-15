@@ -211,7 +211,9 @@ def test_worker_count_does_not_grow_after_many_jobs(tmp_path: Path):
 
 
 def test_queue_capacity_is_enforced(tmp_path: Path):
-    """A queue of size 2 only accepts 2 enqueues before rejecting."""
+    """An executor with max_queue_size=2, max_workers=1 admits at most
+    max_queue_size + max_workers = 3 jobs before rejecting subsequent
+    enqueues."""
     blocker = threading.Event()
     secondary_calls: list = []
 
@@ -231,12 +233,14 @@ def test_queue_capacity_is_enforced(tmp_path: Path):
                 accepted += 1
             else:
                 rejected += 1
-        # Exactly 2 accepted (queue cap), 8 rejected (queue full).
-        assert accepted == 2, f"expected 2 accepted, got {accepted}"
-        assert rejected == 8, f"expected 8 rejected, got {rejected}"
+        # Exactly 3 admitted (max_queue_size 2 + max_workers 1) and 7 rejected.
+        assert accepted == 3, (
+            f"expected 3 accepted (cap = q_size + workers), got {accepted}"
+        )
+        assert rejected == 7, f"expected 7 rejected, got {rejected}"
         acc = ex.accounting()
-        assert acc["comparison_jobs_dropped_queue_full"] == 8
-        assert acc["comparison_jobs_enqueued"] == 2
+        assert acc["comparison_jobs_dropped_queue_full"] == 7
+        assert acc["comparison_jobs_enqueued"] == 3
     finally:
         blocker.set()
         ex.shutdown(drain_timeout_seconds=2.0)
@@ -244,33 +248,56 @@ def test_queue_capacity_is_enforced(tmp_path: Path):
 
 def test_queue_full_never_affects_primary_result(tmp_path: Path):
     """Returning False from enqueue() does not raise or block."""
+    blocker = threading.Event()
+
+    def slow(*args, **kw):
+        blocker.wait(timeout=5.0)
+        return json.dumps({"results": []})
+
     ex, _ = _make_executor(
-        tmp_path, max_workers=1, max_queue_size=1, secondary_call=_ok_secondary
+        tmp_path,
+        max_workers=1,
+        max_queue_size=1,
+        secondary_call=slow,
     )
     try:
-        # Fill the queue + worker.
-        ex.enqueue(_make_job(query_hash="q-0"))
-        # Next enqueue should return False immediately, not raise.
+        # Capacity = max_queue_size + max_workers = 1 + 1 = 2 permits.
+        # Block the worker so neither job completes during this loop.
+        # First two enqueues admitted; third is rejected immediately.
+        assert ex.enqueue(_make_job(query_hash="q-0")) is True
+        assert ex.enqueue(_make_job(query_hash="q-1")) is True
         t0 = time.monotonic()
-        ok = ex.enqueue(_make_job(query_hash="q-1"))
+        ok = ex.enqueue(_make_job(query_hash="q-2"))
         elapsed_ms = (time.monotonic() - t0) * 1000.0
         assert ok is False
         assert elapsed_ms < 10
     finally:
+        blocker.set()
         ex.shutdown()
 
 
 def test_queue_full_increments_dropped_counter(tmp_path: Path):
+    # Capacity = max_queue_size + max_workers = 1 + 1 = 2 permits.
+    # With a real worker, the first enqueue runs and the second is
+    # queued. We use a blocker to ensure neither completes during the
+    # loop, so capacity stays at 2 and 5-2=3 are dropped.
+    blocker = threading.Event()
+
+    def slow(*args, **kw):
+        blocker.wait(timeout=5.0)
+        return json.dumps({"results": []})
+
     ex, _ = _make_executor(
-        tmp_path, max_workers=1, max_queue_size=1, secondary_call=_ok_secondary
+        tmp_path, max_workers=1, max_queue_size=1, secondary_call=slow
     )
     try:
         for i in range(5):
             ex.enqueue(_make_job(query_hash=f"q-{i}"))
         acc = ex.accounting()
-        assert acc["comparison_jobs_dropped_queue_full"] == 4
-        assert acc["comparison_jobs_enqueued"] == 1
+        assert acc["comparison_jobs_dropped_queue_full"] == 3
+        assert acc["comparison_jobs_enqueued"] == 2
     finally:
+        blocker.set()
         ex.shutdown()
 
 
@@ -636,19 +663,26 @@ def test_is_balanced_is_true_for_healthy_run(tmp_path: Path):
 
 
 def test_is_balanced_is_false_when_jobs_were_dropped(tmp_path: Path):
+    blocker = threading.Event()
+
+    def slow(*args, **kw):
+        blocker.wait(timeout=5.0)
+        return json.dumps({"results": []})
+
     ex, _ = _make_executor(
-        tmp_path, max_workers=1, max_queue_size=1, secondary_call=_ok_secondary
+        tmp_path, max_workers=1, max_queue_size=1, secondary_call=slow
     )
     try:
         for i in range(10):
             ex.enqueue(_make_job(query_hash=f"q-{i}"))
-        # 1 enqueued, 9 dropped. Invariant (1) sampled == enqueued + dropped
-        # still holds, so is_balanced may be True at this exact instant.
-        # What we want to assert: the dropped counter is non-zero
-        # AND the executor's accounting reflects this.
+        # Capacity is 2 permits (q_size 1 + workers 1); 10 enqueues ->
+        # 2 admitted + 8 dropped.
         acc = ex.accounting()
-        assert acc["comparison_jobs_dropped_queue_full"] == 9
+        assert acc["comparison_jobs_dropped_queue_full"] == 8
+        # The dropped counter is non-zero AND the executor's accounting
+        # reflects this.
     finally:
+        blocker.set()
         ex.shutdown()
 
 

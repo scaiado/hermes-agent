@@ -33,10 +33,24 @@ Boundedness invariant
 
 This is enforced because:
 
-  - ``_comparison_queue`` is a ``queue.Queue(maxsize=max_queue_size)``.
+  - ``enqueue()`` non-blockingly acquires one permit from
+    ``self._admission_semaphore``, which is initialized with
+    ``max_queue_size + max_workers`` permits. ThreadPoolExecutor
+    uses an unbounded internal ``SimpleQueue``, so we cannot rely
+    on it for admission control; we use a ``BoundedSemaphore``
+    instead. The permit is released exactly once per accepted job,
+    on every termination path (success / timeout / exception /
+    cancellation), inside ``_on_comparison_done``.
   - ``_executor`` is a ``ThreadPoolExecutor(max_workers=max_workers)``.
-  - ``enqueue()`` either succeeds (job placed on the bounded queue AND
-    submitted to the bounded pool) or returns False.
+    Up to ``max_workers`` jobs may run concurrently.
+  - The pool's internal SimpleQueue may grow without bound, but our
+    admission semaphore guarantees that no more than
+    ``max_queue_size + max_workers`` jobs are ever submitted before
+    a corresponding release. Net outstanding is therefore bounded
+    at ``max_queue_size + max_workers``.
+  - ``enqueue()`` either succeeds (permit acquired + future
+    submitted) or returns False (no permit available;
+    ``dropped_queue_full`` incremented).
   - There is NO spawning of per-job threads inside the worker. The
     worker calls Fuli synchronously; Fuli enforces its own per-call
     timeout via its async bridge. The worker stays parked on the
@@ -190,8 +204,7 @@ class ComparisonExecutor:
 
     Thread safety:
       All accounting counters are updated under ``self._lock``. The
-      ``_comparison_queue`` is a thread-safe ``queue.Queue``. The
-      ``_persistence_queue`` is the same.
+      ``_persistence_queue`` is a thread-safe ``queue.Queue``.
     """
 
     def __init__(
@@ -207,19 +220,38 @@ class ComparisonExecutor:
         self.comparison_budget_ms = max(50, comparison_budget_ms)
         self._secondary_call = secondary_call  # injected for tests
 
-        # Queues. The comparison queue is bounded; the persistence
-        # queue is unbounded but drained by a single thread, so its
-        # growth rate is bounded by the rate at which comparisons
-        # finish.
-        self._comparison_queue: "queue.Queue[ComparisonJob]" = queue.Queue(
-            maxsize=self.max_queue_size
+        # Admission control. We DO NOT use a queue.Queue for admission
+        # because ``ThreadPoolExecutor`` consumes its own tasks via an
+        # unbounded internal SimpleQueue. A bounded ``queue.Queue``
+        # placed in series would never be drained and would saturate
+        # after ``maxsize`` lifetime enqueues, permanently rejecting
+        # all further work. Instead, we admit work via a non-blocking
+        # ``BoundedSemaphore``: ``enqueue()`` tries to acquire one
+        # permit; if it cannot, the producer is told the executor is
+        # at capacity (and increments ``dropped_queue_full``). The
+        # permit is held until the future finishes, on every
+        # termination path (success / timeout / exception /
+        # cancellation). This guarantees ``queue_depth`` and
+        # ``active_jobs`` come back to zero after every batch and
+        # capacity is fully recycled.
+        #
+        # Total outstanding jobs at any moment is therefore strictly
+        # bounded by ``max_queue_size + max_workers`` (queue depth
+        # plus in-flight worker jobs).
+        self._admission_semaphore = threading.BoundedSemaphore(
+            value=self.max_queue_size + self.max_workers
         )
+
+        # Persistence queue is unbounded but drained by a single
+        # daemon thread, so its growth rate is bounded by the rate at
+        # which comparisons finish.
         self._persistence_queue: "queue.Queue[ComparisonJob]" = queue.Queue()
 
-        # Workers. Comparison pool is a ThreadPoolExecutor with
-        # max_workers = max_workers. Persistence is a single daemon
-        # thread (NOT a ThreadPoolExecutor) because the persistence
-        # worker is an infinite loop; see start_persistence_worker.
+        # Workers. ``ThreadPoolExecutor`` uses an unbounded internal
+        # ``SimpleQueue`` for its work queue; we do NOT rely on it
+        # for boundedness. The pool size is fixed at ``max_workers``;
+        # we tolerate up to ``max_queue_size`` queued (waiting) jobs
+        # in addition to ``max_workers`` in-flight jobs.
         self._executor = ThreadPoolExecutor(
             max_workers=self.max_workers,
             thread_name_prefix="shadow-compare",
@@ -238,7 +270,9 @@ class ComparisonExecutor:
         self._lock = threading.Lock()
 
         # Watermark tracking. Guarded by self._lock.
-        self._queue_high_watermark = 0
+        self._queue_high_watermark = 0  # max admitted-but-not-running
+        self._active_high_watermark = 0  # max running concurrently
+        self._outstanding_high_watermark = 0  # max (queue + active)
         self._enqueued_futures: set = set()
 
         # Accounting counters. Guarded by self._lock.
@@ -270,11 +304,18 @@ class ComparisonExecutor:
 
     def enqueue(self, job: ComparisonJob) -> bool:
         """Enqueue a comparison job. Returns True if accepted, False if
-        the queue is full.
+        the executor is at capacity.
 
-        The foreground thread MUST NOT block here. ``Queue.put_nowait``
-        raises ``queue.Full`` if the queue is at capacity; we convert
-        that to a False return + accounting increment.
+        The foreground thread MUST NOT block here. The admission
+        semaphore is non-blocking: ``acquire(blocking=False)`` returns
+        False if no permit is available, and we report the rejected
+        enqueue as ``comparison_jobs_dropped_queue_full``.
+
+        Accounting identity (every accepted job corresponds to one
+        permit held from this call until the future completes):
+            sampled == enqueued + dropped
+            sampled - (enqueued + dropped) == 0  # holds per-batch
+            permitted == enqueued
         """
         # Read-and-mutate under the lock to avoid GIL races on
         # _accepting and the dropped counter.
@@ -283,38 +324,94 @@ class ComparisonExecutor:
                 self._jobs_dropped_queue_full += 1
                 return False
             self._jobs_sampled += 1
-            try:
-                self._comparison_queue.put_nowait(job)
-            except queue.Full:
+            # Non-blocking permit acquire. The permit is held until
+            # _on_comparison_done() releases it (success, timeout,
+            # exception, or cancellation).
+            if not self._admission_semaphore.acquire(blocking=False):
                 self._jobs_dropped_queue_full += 1
+                # IMPORTANT: never pair put_nowait with this; we no
+                # longer touch any queue here. Only the semaphore
+                # governs admission.
                 return False
             self._jobs_enqueued += 1
-            depth = self._comparison_queue.qsize()
+            # Track queue_depth = enqueued - started - completed.
+            # We don't have a separate queue.Queue; the depth IS the
+            # admitted-but-not-yet-running gap.
+            depth = max(
+                0,
+                self._jobs_enqueued
+                - self._jobs_started
+                - self._jobs_completed
+                - self._jobs_timed_out
+                - self._jobs_failed,
+            )
             if depth > self._queue_high_watermark:
                 self._queue_high_watermark = depth
-            # Submit to the bounded pool. The future is tracked for
-            # flush(). Pool submit is non-blocking: ThreadPoolExecutor
-            # uses a bounded LinkedBlockingQueue internally with size
-            # = max_workers; submission beyond capacity would block.
-            # We prevent that by ensuring the comparison queue is
-            # bounded AND the worker count is fixed. If the executor
-            # internal queue ever filled, the worker count is at
-            # capacity and the comparison_queue is at capacity; we
-            # would have rejected the enqueue earlier.
+            # Submit to the bounded pool. NOTE: ThreadPoolExecutor
+            # has an unbounded internal SimpleQueue, so submit() never
+            # blocks. We rely on the admission semaphore for
+            # boundedness; the pool size limits concurrent running
+            # jobs to max_workers.
             future = self._executor.submit(self._run_comparison, job)
             self._enqueued_futures.add(future)
         future.add_done_callback(self._on_comparison_done)
         return True
 
     def _on_comparison_done(self, future: Future) -> None:
+        """Release the admission semaphore exactly once on every
+        termination path, including future cancellation.
+
+        All terminal counters (completed / timed_out / failed) are
+        incremented inside ``_run_comparison``'s finally-like path.
+        This callback exists exclusively to release the permit.
+        Without it, capacity is permanently leaked after every batch
+        and the executor reaches saturation.
+        """
+        cancelled = False
+        try:
+            cancelled = future.cancelled()
+        except Exception:
+            cancelled = False
+        # Always release the permit exactly once. We use a single
+        # ``release_permit`` sentinel attribute set on the future the
+        # first time the callback runs.
+        released = False
+        try:
+            released = getattr(future, "_shadow_permit_released", False)
+        except Exception:
+            released = False
+        if not released:
+            try:
+                setattr(future, "_shadow_permit_released", True)
+            except Exception:
+                pass
+            try:
+                self._admission_semaphore.release()
+            except ValueError:
+                # BoundedSemaphore.release() raises ValueError if the
+                # counter is already at capacity. Should not happen if
+                # _enqueue/_release are paired correctly; surface it.
+                logger.exception(
+                    "shadow comparison executor semaphore over-release"
+                )
         with self._lock:
             self._enqueued_futures.discard(future)
-            if future.cancelled():
+            if cancelled:
+                # Cancellation counts as failed (no normal completion
+                # path ran). If _run_comparison already incremented
+                # ``_jobs_failed`` before being cancelled, this is a
+                # double-count -- but Python's Future.cancel() only
+                # succeeds on a future that has not started, so this
+                # branch is only taken when the future never reached
+                # _run_comparison. Therefore it is safe to increment
+                # _jobs_failed here exactly once.
                 self._jobs_failed += 1
                 return
         exc = future.exception()
         if exc is not None:
-            # Already counted in _run_comparison's except block.
+            # _run_comparison's exception handler already incremented
+            # the counter; the semaphore release is the only thing
+            # left to do here.
             logger.debug("comparison future raised: %s", exc)
 
     # --- worker (runs in a thread pool) -------------------------------
@@ -332,6 +429,28 @@ class ComparisonExecutor:
         try:
             with self._lock:
                 self._jobs_started += 1
+                # active_jobs = started - (completed + timed_out + failed).
+                active = max(
+                    0,
+                    self._jobs_started
+                    - self._jobs_completed
+                    - self._jobs_timed_out
+                    - self._jobs_failed,
+                )
+                if active > self._active_high_watermark:
+                    self._active_high_watermark = active
+                # Recompute outstanding high-watermark.
+                depth = max(
+                    0,
+                    self._jobs_enqueued
+                    - self._jobs_started
+                    - self._jobs_completed
+                    - self._jobs_timed_out
+                    - self._jobs_failed,
+                )
+                outstanding = depth + active
+                if outstanding > self._outstanding_high_watermark:
+                    self._outstanding_high_watermark = outstanding
             comparison = job.comparison
             queue_wait_ms = job.age_seconds() * 1000.0
             sec_start = time.monotonic()
@@ -576,6 +695,21 @@ class ComparisonExecutor:
         consistent with each other and with the queue depth reads.
         """
         with self._lock:
+            # Compute live queue_depth and active_jobs under the lock.
+            active_jobs = max(
+                0,
+                self._jobs_started
+                - self._jobs_completed
+                - self._jobs_timed_out
+                - self._jobs_failed,
+            )
+            queue_depth = max(
+                0,
+                self._jobs_enqueued
+                - self._jobs_started,
+            )
+            outstanding_jobs = queue_depth + active_jobs
+            # Pending = sampled - persisted (the no-final-row gap).
             return {
                 "comparison_jobs_sampled": self._jobs_sampled,
                 "comparison_jobs_enqueued": self._jobs_enqueued,
@@ -589,27 +723,34 @@ class ComparisonExecutor:
                 - self._jobs_persisted
                 - self._persistence_failed,
                 "comparison_jobs_orphaned": self._jobs_orphaned,
-                "queue_depth": self._comparison_queue.qsize(),
+                "queue_depth": queue_depth,
+                "active_jobs": active_jobs,
+                "outstanding_jobs": outstanding_jobs,
                 "queue_high_watermark": self._queue_high_watermark,
+                "active_high_watermark": self._active_high_watermark,
+                "outstanding_high_watermark": self._outstanding_high_watermark,
                 "persistence_queue_depth": self._persistence_queue.qsize(),
                 "persistence_started": self._persistence_started,
                 "persistence_failed": self._persistence_failed,
                 "duplicate_idempotent": self._duplicate_idempotent,
                 "unexpected_collision": self._unexpected_collision,
+                "admission_capacity": self.max_queue_size + self.max_workers,
             }
 
     def is_balanced(self) -> bool:
         """True iff the accounting is internally consistent.
 
-        The four invariant identities:
+        The five invariant identities:
           (1) sampled == enqueued + dropped_queue_full
               (every sampled query is either enqueued or dropped)
-          (2) enqueued == started + pending
+          (2) enqueued == started + queue_depth
               (every enqueued job is either started or still queued)
           (3) started == completed + timed_out + failed
               (every started job finishes in one of those three ways)
-          (4) completed + timed_out == persisted
-              (every comparison that produced a result is persisted)
+          (4) completed + timed_out + failed == persisted
+              (every comparison has exactly one persisted terminal row)
+          (5) queue_depth + active_jobs <= max_queue_size + max_workers
+              (admission capacity is the upper bound on outstanding)
         """
         a = self.accounting()
         return (
@@ -617,7 +758,7 @@ class ComparisonExecutor:
             == a["comparison_jobs_enqueued"]
             + a["comparison_jobs_dropped_queue_full"]
             and a["comparison_jobs_enqueued"]
-            == a["comparison_jobs_started"] + a["comparison_jobs_pending"]
+            == a["comparison_jobs_started"] + a["queue_depth"]
             and a["comparison_jobs_started"]
             == a["comparison_jobs_completed"]
             + a["comparison_jobs_timed_out"]
@@ -626,6 +767,8 @@ class ComparisonExecutor:
             + a["comparison_jobs_timed_out"]
             + a["comparison_jobs_failed"]
             == a["comparison_jobs_persisted"]
+            and a["outstanding_jobs"]
+            <= a["admission_capacity"]
         )
 
     # --- flush + shutdown ---------------------------------------------
