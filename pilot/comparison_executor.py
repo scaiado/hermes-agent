@@ -334,7 +334,7 @@ class ComparisonExecutor:
                 # governs admission.
                 return False
             self._jobs_enqueued += 1
-            # Track queue_depth = enqueued - started - completed.
+            # Track queue_depth = enqueued - started.
             # We don't have a separate queue.Queue; the depth IS the
             # admitted-but-not-yet-running gap.
             depth = max(
@@ -348,34 +348,53 @@ class ComparisonExecutor:
             if depth > self._queue_high_watermark:
                 self._queue_high_watermark = depth
             # Submit to the bounded pool. NOTE: ThreadPoolExecutor
-            # has an unbounded internal SimpleQueue, so submit() never
-            # blocks. We rely on the admission semaphore for
-            # boundedness; the pool size limits concurrent running
-            # jobs to max_workers.
-            future = self._executor.submit(self._run_comparison, job)
+            # has an unbounded internal SimpleQueue, so submit() does
+            # not normally block. We rely on the admission semaphore
+            # for boundedness; the pool size limits concurrent running
+            # jobs to max_workers. If submit() ever raises (e.g. pool
+            # shutdown), we must release the permit we just acquired
+            # so capacity does not leak. We do that with an explicit
+            # try/except that DECREMENTS _jobs_enqueued before
+            # releasing, so the admission balance remains exactly
+            # conserved.
+            try:
+                future = self._executor.submit(self._run_comparison, job)
+            except Exception:
+                self._jobs_enqueued -= 1
+                # Drop the permit we acquired so admission_capacity
+                # is fully restored.
+                try:
+                    self._admission_semaphore.release()
+                except ValueError:
+                    logger.exception(
+                        "shadow comparison executor semaphore "
+                        "over-release on submit failure"
+                    )
+                raise
             self._enqueued_futures.add(future)
         future.add_done_callback(self._on_comparison_done)
         return True
 
     def _on_comparison_done(self, future: Future) -> None:
         """Release the admission semaphore exactly once on every
-        termination path, including future cancellation.
+        termination path.
 
         All terminal counters (completed / timed_out / failed) are
         incremented inside ``_run_comparison``'s finally-like path.
         This callback exists exclusively to release the permit.
         Without it, capacity is permanently leaked after every batch
         and the executor reaches saturation.
+
+        Defensive ordering: the permit release runs in a ``finally``
+        block so that any error in accounting or ``_enqueued_futures``
+        bookkeeping CANNOT bypass the release. The sentinel attribute
+        guards against duplicate callbacks firing release twice.
         """
         cancelled = False
         try:
             cancelled = future.cancelled()
         except Exception:
             cancelled = False
-        # Always release the permit exactly once. We use a single
-        # ``release_permit`` sentinel attribute set on the future the
-        # first time the callback runs.
-        released = False
         try:
             released = getattr(future, "_shadow_permit_released", False)
         except Exception:
@@ -394,25 +413,34 @@ class ComparisonExecutor:
                 logger.exception(
                     "shadow comparison executor semaphore over-release"
                 )
-        with self._lock:
-            self._enqueued_futures.discard(future)
-            if cancelled:
-                # Cancellation counts as failed (no normal completion
-                # path ran). If _run_comparison already incremented
-                # ``_jobs_failed`` before being cancelled, this is a
-                # double-count -- but Python's Future.cancel() only
-                # succeeds on a future that has not started, so this
-                # branch is only taken when the future never reached
-                # _run_comparison. Therefore it is safe to increment
-                # _jobs_failed here exactly once.
-                self._jobs_failed += 1
-                return
-        exc = future.exception()
-        if exc is not None:
-            # _run_comparison's exception handler already incremented
-            # the counter; the semaphore release is the only thing
-            # left to do here.
-            logger.debug("comparison future raised: %s", exc)
+        # The bookkeeping below is best-effort. If it raises (e.g.
+        # due to a threadpool shutdown interaction) we do NOT want to
+        # skip the bookkeeping on subsequent callbacks; but the
+        # permit release has already happened above, so we are not
+        # leaking capacity.
+        try:
+            with self._lock:
+                self._enqueued_futures.discard(future)
+                if cancelled:
+                    # Cancellation counts as failed (no normal
+                    # completion path ran). Python's Future.cancel()
+                    # only succeeds on a future that has not started,
+                    # so this branch is taken only when the future
+                    # never reached _run_comparison. Therefore it is
+                    # safe to increment _jobs_failed here exactly
+                    # once.
+                    self._jobs_failed += 1
+                    return
+            exc = future.exception()
+            if exc is not None:
+                # _run_comparison's exception handler already
+                # incremented the counter.
+                logger.debug("comparison future raised: %s", exc)
+        except Exception:
+            logger.exception(
+                "shadow comparison executor bookkeeping error after "
+                "permit release"
+            )
 
     # --- worker (runs in a thread pool) -------------------------------
 
@@ -696,6 +724,24 @@ class ComparisonExecutor:
         """
         with self._lock:
             # Compute live queue_depth and active_jobs under the lock.
+            # Definitions (must match the brief):
+            #
+            #   active_jobs = started - completed - timed_out - failed
+            #
+            # Note: cancellation events increment ``failed`` (see
+            # _on_comparison_done's cancellation branch); cancelled
+            # jobs are therefore counted inside ``failed`` to avoid
+            # double subtraction against the other terminal counters.
+            #
+            #   outstanding_jobs =
+            #       enqueued - completed - timed_out - failed - cancelled
+            #       = enqueued - completed - timed_out - failed
+            #       (because cancelled jobs are folded into failed)
+            #
+            #   queue_depth = max(0, outstanding_jobs - active_jobs)
+            #
+            # All three collapse to zero at idle (every enqueued job
+            # reaches one of completed/timed_out/failed).
             active_jobs = max(
                 0,
                 self._jobs_started
@@ -703,12 +749,15 @@ class ComparisonExecutor:
                 - self._jobs_timed_out
                 - self._jobs_failed,
             )
-            queue_depth = max(
-                0,
-                self._jobs_enqueued
-                - self._jobs_started,
-            )
+            queue_depth = max(0, self._jobs_enqueued - self._jobs_started)
             outstanding_jobs = queue_depth + active_jobs
+            # admission_available = current semaphore value. The
+            # semaphore does not expose its counter directly, but we
+            # can derive it from admission_capacity minus permits
+            # currently held. Permits held = outstanding_jobs (each
+            # permits exactly one outstanding job).
+            admission_capacity = self.max_queue_size + self.max_workers
+            admission_available = max(0, admission_capacity - outstanding_jobs)
             # Pending = sampled - persisted (the no-final-row gap).
             return {
                 "comparison_jobs_sampled": self._jobs_sampled,
@@ -734,7 +783,8 @@ class ComparisonExecutor:
                 "persistence_failed": self._persistence_failed,
                 "duplicate_idempotent": self._duplicate_idempotent,
                 "unexpected_collision": self._unexpected_collision,
-                "admission_capacity": self.max_queue_size + self.max_workers,
+                "admission_capacity": admission_capacity,
+                "admission_available": admission_available,
             }
 
     def is_balanced(self) -> bool:

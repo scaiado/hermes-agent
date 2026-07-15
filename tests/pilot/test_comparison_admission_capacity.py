@@ -495,6 +495,143 @@ def test_is_balanced_after_many_lifetime_jobs(tmp_path: Path):
         ex.shutdown()
 
 
+# 18-mandatory test 300: explicitly recycle past 128 and 256 lifetime bounds.
+def test_300_jobs_recycle_capacity_past_multiple_lifetime_bounds(
+    tmp_path: Path,
+):
+    """Submit 300 jobs at q=128, w=1 (admission_capacity=129) and
+    assert that jobs 129, 256, and 300 are all accepted, all
+    persisted, and the post-flush state is fully idle.
+
+    Submits in drained batches of 50 so the worker can keep up and
+    the producer does not artificially flood. Each batch is
+    flushed before the next, but the cumulative state still
+    crosses 128 (lifetime) and 256 (twice lifetime) admissions.
+    """
+    ex, store = _make_executor(
+        tmp_path, max_workers=1, max_queue_size=128
+    )
+    try:
+        accepted = 0
+        for batch in range(6):  # 6 batches * 50 = 300 jobs
+            for i in range(50):
+                qh = f"b{batch:02d}-q{i:03d}"
+                assert ex.enqueue(_make_job(query_hash=qh)) is True, (
+                    f"job {qh} rejected (capacity leaked)"
+                )
+                # Pace so the worker can keep up.
+                time.sleep(0.005)
+                accepted += 1
+            # Drain each batch.
+            ex.flush(timeout_seconds=60.0)
+
+        # Confirm the boundary jobs that the pre-fix bug would
+        # have rejected.
+        # Job 129 = b02-q029 (3rd batch, 30th job), Job 256 = b05-q005,
+        # Job 300 = b05-q049.
+        boundary_jobs = []
+        con = sqlite3.connect(str(store.db_path))
+        for qh in ("b02-q029", "b05-q005", "b05-q049"):
+            row = con.execute(
+                "SELECT comparison_id, secondary_status FROM comparisons "
+                "WHERE query_hash = ?",
+                (qh,),
+            ).fetchone()
+            boundary_jobs.append((qh, row is not None, row))
+        con.close()
+        for qh, found, row in boundary_jobs:
+            assert found, (
+                f"boundary job {qh!r} not persisted; this is the direct "
+                "reproduction of the lifetime-saturation bug the fix "
+                "targets"
+            )
+
+        ex.flush(timeout_seconds=60.0)
+        acc = ex.accounting()
+        assert acc["comparison_jobs_sampled"] == 300
+        assert acc["comparison_jobs_enqueued"] == 300
+        assert acc["comparison_jobs_started"] == 300
+        assert acc["comparison_jobs_persisted"] == 300
+        assert acc["comparison_jobs_dropped_queue_full"] == 0
+        # Idle invariants.
+        assert acc["queue_depth"] == 0
+        assert acc["active_jobs"] == 0
+        assert acc["outstanding_jobs"] == 0
+        assert acc["admission_available"] == acc["admission_capacity"], (
+            f"admission_available={acc['admission_available']} but "
+            f"admission_capacity={acc['admission_capacity']}; permits "
+            "leaked"
+        )
+        assert acc["comparison_jobs_pending"] == 0
+        assert ex.is_balanced() is True
+    finally:
+        ex.shutdown()
+
+
+def test_submit_failure_releases_permit_and_no_enqueue_counted(
+    tmp_path: Path,
+):
+    """If ``ThreadPoolExecutor.submit()`` raises, the executor must
+    release the permit it just acquired AND decrement
+    ``comparison_jobs_enqueued`` so the enqueue is treated as
+    rejected (not started, not persisted). No capacity leak.
+    """
+    ex, store = _make_executor(tmp_path, max_workers=1, max_queue_size=4)
+    try:
+        # Replace the executor's submit with a function that raises.
+        original_submit = ex._executor.submit
+        call_count = {"n": 0}
+
+        def failing_submit(*args, **kwargs):
+            call_count["n"] += 1
+            raise RuntimeError("simulated pool shutdown")
+
+        ex._executor.submit = failing_submit  # type: ignore[assignment]
+        # Also enforce that __call__ backstop doesn't get used by
+        # any other path: enqueue is the only caller of submit here.
+
+        # Pre-acquisition accounting baseline:
+        sampled_before = ex._jobs_sampled
+        enqueued_before = ex._jobs_enqueued
+        dropped_before = ex._jobs_dropped_queue_full
+
+        # enqueue() should raise through (because we re-raise after
+        # releasing the permit and decrementing enqueued). All
+        # accounting must end at the baseline: no increment.
+        raised = None
+        try:
+            ex.enqueue(_make_job(query_hash="submit-fail"))
+        except RuntimeError as e:
+            raised = e
+
+        assert raised is not None, "enqueue should re-raise submit's error"
+        assert call_count["n"] == 1, "submit must have been called once"
+
+        # The permit was acquired before submit was called; the
+        # failure path must have released it. Verify by submitting
+        # the full admission_capacity worth of jobs without drops.
+        admission_capacity = ex.max_queue_size + ex.max_workers
+        for i in range(admission_capacity):
+            ex._executor.submit = original_submit  # type: ignore[assignment]
+            assert ex.enqueue(_make_job(query_hash=f"after-{i}")) is True
+            time.sleep(0.005)
+
+        # Accounting must show admission_capacity jobs enqueued, not
+        # admission_capacity + 1.
+        assert ex._jobs_enqueued == enqueued_before + admission_capacity
+        assert ex._jobs_dropped_queue_full == dropped_before, (
+            "enqueue must NOT have incremented dropped_queue_full when "
+            "submit() raised; submit() failure is its own category"
+        )
+        # No capacity leak.
+        ex.flush(timeout_seconds=30.0)
+        assert ex._jobs_sampled == sampled_before + 1 + admission_capacity
+        # Persisted equals enqueued (no orphan from submit failure).
+        assert ex._jobs_persisted == enqueued_before + admission_capacity
+    finally:
+        ex.shutdown()
+
+
 # Integration regression: 200 sampled jobs at the soak shape.
 def test_integration_200_jobs_soak_shape(tmp_path: Path):
     """The exact shape that would have failed pre-fix at job 129."""
