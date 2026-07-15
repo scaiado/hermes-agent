@@ -52,7 +52,9 @@ import argparse
 import hashlib
 import json
 import os
+import resource
 import shutil
+import signal
 import sqlite3
 import sys
 import time
@@ -127,6 +129,57 @@ def sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8", "replace")).hexdigest()
 
 
+def collect_resource_metrics() -> Dict[str, Any]:
+    """Best-effort RSS / thread / FD snapshot via standard library only.
+
+    Returns a dict with whatever metrics we can read on the current
+    platform. Missing metrics return as None rather than raising.
+    """
+    out: Dict[str, Any] = {"timestamp": time.time()}
+    try:
+        # Python 3.11+ has os.getrusage with Linux ru_maxrss in KB;
+        # macOS reports bytes.
+        rusage = resource.getrusage(resource.RUSAGE_SELF)
+        # macOS returns ru_maxrss in bytes; Linux returns KB.
+        ru_maxrss = rusage.ru_maxrss
+        out["rss_bytes"] = (
+            ru_maxrss if sys.platform == "darwin" else ru_maxrss * 1024
+        )
+        out["user_cpu_seconds"] = rusage.ru_utime
+        out["system_cpu_seconds"] = rusage.ru_stime
+    except (OSError, ValueError):
+        out["rss_bytes"] = None
+        out["user_cpu_seconds"] = None
+        out["system_cpu_seconds"] = None
+    try:
+        import threading as _threading
+        out["thread_count"] = _threading.active_count()
+    except Exception:
+        out["thread_count"] = None
+    try:
+        # FD count via /proc/self/fd on Linux, /dev/fd on macOS.
+        if os.path.isdir("/proc/self/fd"):
+            out["fd_count"] = len(os.listdir("/proc/self/fd"))
+        else:
+            out["fd_count"] = len(os.listdir("/dev/fd"))
+    except (OSError, PermissionError):
+        out["fd_count"] = None
+    return out
+
+
+def atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
+    """Write JSON atomically: write to <path>.tmp, fsync, rename."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2, default=str)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass
+    os.replace(tmp, path)
+
+
 class QualRun:
     """Self-contained live qualification runner.
 
@@ -143,6 +196,17 @@ class QualRun:
         (self.qual_home / "memories").mkdir(exist_ok=True)
         (self.qual_home / "fuli").mkdir(exist_ok=True)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        # Checkpoint / stop / report paths.
+        ckpt_dir = args.checkpoints_dir or str(self.output_dir / "checkpoints")
+        self.checkpoints_dir = Path(ckpt_dir)
+        self.checkpoints_dir.mkdir(parents=True, exist_ok=True)
+        self.report_json_path = (
+            Path(args.report_json)
+            if args.report_json
+            else self.output_dir / "report.json"
+        )
+        self.stop_file = Path(args.stop_file) if args.stop_file else None
+        self.checkpoint_seconds = max(0, args.checkpoint_minutes * 60)
         self.comparisons_db = self.qual_home / "memories" / "comparisons.db"
         self.fuli_db_src = Path("/Users/caiado/.hermes/profiles/shadow-pilot/memories/fuli.db")
         self.fuli_config_src = Path(
@@ -300,7 +364,7 @@ class QualRun:
             )
         )
 
-        # ---- 15-minute controlled workload ----
+        # ---- Controlled workload ----
         duration_seconds = max(60, self.args.duration_minutes * 60)
         deadline = time.monotonic() + duration_seconds
 
@@ -312,8 +376,42 @@ class QualRun:
         sampled_count = 0
         invariant_failures: List[str] = []
 
+        # Pause / stop wiring.
+        # - signal-driven stop event: SIGINT/SIGTERM → cooperative stop.
+        # - stop_file watcher: presence of self.stop_file → cooperative stop.
+        # - checkpoint loop: every checkpoint_seconds, write JSON.
+        stop_requested = {"value": False, "reason": "", "gate": ""}
+
+        def _request_stop(reason: str, gate: str) -> None:
+            stop_requested["value"] = True
+            stop_requested["reason"] = reason
+            stop_requested["gate"] = gate
+
+        def _sig_stop(signum, frame):  # noqa: ARG001
+            _request_stop(f"signal {signum}", "")
+
+        try:
+            signal.signal(signal.SIGINT, _sig_stop)
+            signal.signal(signal.SIGTERM, _sig_stop)
+        except (ValueError, OSError):
+            # SIGTERM may not be installable from non-main threads; ignore.
+            pass
+
+        next_checkpoint_at = (
+            time.monotonic() + self.checkpoint_seconds
+            if self.checkpoint_seconds > 0
+            else None
+        )
         i = 0
-        while time.monotonic() < deadline:
+        while time.monotonic() < deadline and not stop_requested["value"]:
+            # Stop sentinel: if stop_file exists, request graceful stop.
+            if self.stop_file and self.stop_file.exists():
+                _request_stop(
+                    f"stop file present: {self.stop_file}",
+                    "explicit_stop_file",
+                )
+                break
+
             qtype, query = QUERY_SET[i % len(QUERY_SET)]
             i += 1
             total_reads += 1
@@ -359,7 +457,34 @@ class QualRun:
             # for any 15-minute window.
             time.sleep(3.7)
 
+            # Periodic checkpoint + auto-pause evaluation.
+            if (
+                next_checkpoint_at is not None
+                and time.monotonic() >= next_checkpoint_at
+            ):
+                auto_pause_gate = self._write_checkpoint(
+                    shadow,
+                    enqueue_overheads_ms,
+                    primary_latencies_ms,
+                    total_reads,
+                    sampled_count,
+                    invariant_count,
+                    invariant_failures,
+                    stop_requested["reason"],
+                )
+                if auto_pause_gate:
+                    _request_stop(
+                        f"auto-pause gate triggered: {auto_pause_gate}",
+                        auto_pause_gate,
+                    )
+                    break
+                next_checkpoint_at = (
+                    time.monotonic() + self.checkpoint_seconds
+                )
+
         workload_elapsed = time.monotonic() - self.start_monotonic
+        self.report["stop_reason"] = stop_requested["reason"]
+        self.report["stop_gate"] = stop_requested["gate"]
 
         # ---- Bounded flush ----
         flush_start = time.monotonic()
@@ -550,6 +675,193 @@ class QualRun:
 
         return self._finalize(shadow, success=all(checks.values()))
 
+    # ------------------------------------------------------------------
+    # Checkpoint + auto-pause
+    # ------------------------------------------------------------------
+
+    def _write_checkpoint(
+        self,
+        shadow: Any,
+        enqueue_overheads_ms: List[float],
+        primary_latencies_ms: List[float],
+        total_reads: int,
+        sampled_count: int,
+        invariant_count: int,
+        invariant_failures: List[str],
+        current_stop_reason: str,
+    ) -> Optional[str]:
+        """Write a checkpoint JSON and evaluate hard-pause gates.
+
+        Returns the gate name that triggered an auto-pause (or None).
+        The checkpoint is written atomically via tmp+rename and includes
+        executor accounting, SQLite integrity, and resource metrics.
+        """
+        # Explicit flush before each checkpoint to drain the executor.
+        try:
+            shadow.flush_comparisons(timeout_seconds=30.0)
+        except Exception:
+            pass
+
+        acc = shadow.executor_accounting()
+        balanced = shadow.executor_is_balanced()
+
+        # Run-scoped rows for SQLite integrity, namespace, and
+        # content_captured checks.
+        all_rows = self.run_sql(
+            "SELECT comparison_id, run_id, namespace, content_captured, "
+            "secondary_status, secondary_error_category, secondary_latency_ms "
+            "FROM comparisons WHERE run_id = ?",
+            (self.run_id,),
+        )
+
+        secondary_latencies_sorted = sorted(
+            [r.get("secondary_latency_ms") or 0 for r in all_rows]
+        )
+        all_namespaces = set(r.get("namespace") for r in all_rows)
+        all_content_captured_false = (
+            all(r.get("content_captured") == 0 for r in all_rows)
+            if all_rows
+            else False
+        )
+
+        secondary_successful = sum(
+            1 for r in all_rows if r.get("secondary_status") == "success"
+        )
+        secondary_total = len(all_rows)
+        success_rate = (
+            secondary_successful / secondary_total if secondary_total else 1.0
+        )
+
+        # SQLite / WAL
+        con = sqlite3.connect(str(self.comparisons_db))
+        ic = con.execute("PRAGMA integrity_check").fetchall()
+        qc = con.execute("PRAGMA quick_check").fetchall()
+        wal = con.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+        con.close()
+
+        resources = collect_resource_metrics()
+
+        primary_mutations = total_reads - invariant_count
+
+        # Roll-up
+        ckpt = {
+            "schema_version": 1,
+            "kind": "checkpoint",
+            "run_id": self.run_id,
+            "qual_home": str(self.qual_home),
+            "comparisons_db": str(self.comparisons_db),
+            "checkpoint_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "elapsed_seconds": time.monotonic() - self.start_monotonic,
+            "total_reads": total_reads,
+            "sampled_reads": sampled_count,
+            "persisted_rows_run_scoped": secondary_total,
+            "secondary": {
+                "success_count": secondary_successful,
+                "non_success_count": secondary_total - secondary_successful,
+                "secondary_success_rate": success_rate,
+                "p50_ms": percentile(secondary_latencies_sorted, 50),
+                "p95_ms": percentile(secondary_latencies_sorted, 95),
+                "max_ms": (
+                    max(secondary_latencies_sorted)
+                    if secondary_latencies_sorted
+                    else 0.0
+                ),
+            },
+            "enqueue_overhead_ms": {
+                "p50": percentile(enqueue_overheads_ms, 50),
+                "p95": percentile(enqueue_overheads_ms, 95),
+                "max": (
+                    max(enqueue_overheads_ms)
+                    if enqueue_overheads_ms
+                    else 0.0
+                ),
+                "n": len(enqueue_overheads_ms),
+            },
+            "primary_latency_ms": {
+                "p50": percentile(primary_latencies_ms, 50),
+                "p95": percentile(primary_latencies_ms, 95),
+                "max": (
+                    max(primary_latencies_ms)
+                    if primary_latencies_ms
+                    else 0.0
+                ),
+            },
+            "executor_accounting": acc,
+            "is_balanced": balanced,
+            "queue": {
+                "dropped_queue_full": acc["comparison_jobs_dropped_queue_full"],
+                "depth": acc.get("queue_depth", 0),
+                "high_watermark": acc.get("queue_high_watermark", 0),
+                "persistence_depth": acc.get("persistence_queue_depth", 0),
+            },
+            "persistence": {
+                "failures": acc["persistence_failed"],
+                "started": acc.get("persistence_started", 0),
+            },
+            "orphans": acc["comparison_jobs_orphaned"],
+            "collisions": acc["unexpected_collision"],
+            "pending": acc["comparison_jobs_pending"],
+            "primary_hash_mutations": primary_mutations,
+            "invariant_failures_sample": invariant_failures[-5:],
+            "privacy": {
+                "namespaces": sorted(all_namespaces),
+                "all_content_captured_false": all_content_captured_false,
+            },
+            "integrity_check": ic,
+            "quick_check": qc,
+            "wal_checkpoint": wal,
+            "resources": resources,
+            "running_health": (
+                "degraded" if 0.80 <= success_rate < 0.90 else "healthy"
+            ),
+            "current_stop_reason": current_stop_reason,
+        }
+
+        # ---- Hard-pause gates ----
+        auto_pause_gate: Optional[str] = None
+        if primary_mutations > 0:
+            auto_pause_gate = "primary_output_mutation"
+        elif all_namespaces and all_namespaces != {"hermes:shadow-pilot"}:
+            auto_pause_gate = "namespace_violation"
+        elif all_rows and not all_content_captured_false:
+            auto_pause_gate = "raw_content_violation"
+        elif acc["unexpected_collision"] > 0:
+            auto_pause_gate = "unexpected_collision"
+        elif acc["persistence_failed"] > 0:
+            auto_pause_gate = "persistence_failure"
+        elif acc["comparison_jobs_dropped_queue_full"] > 0:
+            auto_pause_gate = "queue_drops"
+        elif acc["comparison_jobs_orphaned"] > 0:
+            auto_pause_gate = "orphaned_worker"
+        elif ic != [("ok",)] or qc != [("ok",)]:
+            auto_pause_gate = "sqlite_integrity_failure"
+        elif secondary_total >= 20 and success_rate < 0.80:
+            auto_pause_gate = "fuli_secondary_success_below_80pct"
+
+        ckpt["auto_pause_gate"] = auto_pause_gate
+        ckpt["degraded"] = (
+            auto_pause_gate is None
+            and 0.80 <= success_rate < 0.90
+        )
+
+        # Atomic write.
+        ts = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
+        ckpt_path = self.checkpoints_dir / f"checkpoint-{ts}.json"
+        try:
+            atomic_write_json(ckpt_path, ckpt)
+        except Exception as e:
+            # Failing to write a checkpoint is bad but must not kill the run.
+            print(f"checkpoint write failed: {type(e).__name__}: {e}")
+
+        # Mirror to <output_dir>/report.json so the operator can
+        # `cat` one file at any moment.
+        try:
+            atomic_write_json(self.report_json_path, ckpt)
+        except Exception:
+            pass
+
+        return auto_pause_gate
+
     def _run_redacted_export(
         self, path: Path, shadow: Any, expected_persisted: int
     ) -> tuple[bool, int, int]:
@@ -602,10 +914,25 @@ class QualRun:
         self.report["decision"] = "GO" if success else "NO-GO"
         self.report["success"] = success
 
-        # Emit JSON report.
-        report_path = self.output_dir / "report.json"
-        with open(report_path, "w") as f:
-            json.dump(self.report, f, indent=2, default=str)
+        # Emit JSON report. If we wrote checkpoints, the final
+        # report.json mirrors the latest checkpoint envelope.
+        self.report_path = str(self.report_json_path)
+        if not self.checkpoints_dir or not any(
+            (self.checkpoints_dir / f"checkpoint-{ts}.json").exists()
+            for ts in [
+                time.strftime(
+                    "%Y%m%dT%H%M%S",
+                    time.gmtime(),
+                )
+            ]
+        ):
+            # Fall back to writing the final report under
+            # report_json_path, even when no checkpoint fired
+            # (e.g. duration too short for any checkpoint).
+            try:
+                atomic_write_json(self.report_json_path, self.report)
+            except Exception:
+                pass
 
         # Emit console summary.
         print()
@@ -616,7 +943,7 @@ class QualRun:
         print(f"OUTPUT_DIR: {self.output_dir}")
         print(f"DURATION_MINUTES: {self.args.duration_minutes}")
         print(f"DECISION: {self.report['decision']}")
-        print(f"Report JSON: {report_path}")
+        print(f"Report JSON: {self.report_path}")
         print(f"Redacted export: {self.report.get('redacted_export_path')}")
         print("=" * 78)
         for k, v in self.report.get("checks", {}).items():
@@ -635,7 +962,7 @@ class QualRun:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run a corrected 15-minute live 5% shadow pilot qualification."
+        description="Run a controlled live shadow pilot qualification or soak.",
     )
     parser.add_argument(
         "--duration-minutes",
@@ -661,7 +988,40 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="",
         help="Directory where reports and the redacted export land. "
-             "Defaults to reports/p1-live-qualify-<run_id>/ under the repo.",
+             "Defaults to reports/p1-<run_id>/ under the repo.",
+    )
+    parser.add_argument(
+        "--checkpoint-minutes",
+        type=int,
+        default=0,
+        help="If > 0, write a checkpoint every N minutes (default 0 = disabled).",
+    )
+    parser.add_argument(
+        "--pid-file",
+        type=str,
+        default="",
+        help="Optional PID file path. Written at start, removed at clean exit.",
+    )
+    parser.add_argument(
+        "--stop-file",
+        type=str,
+        default="",
+        help="Optional STOP sentinel. When the file exists, the driver "
+             "writes a final checkpoint and gracefully stops at the next "
+             "check.",
+    )
+    parser.add_argument(
+        "--checkpoints-dir",
+        type=str,
+        default="",
+        help="Directory where checkpoint JSON files land. Defaults to "
+             "<output-dir>/checkpoints/.",
+    )
+    parser.add_argument(
+        "--report-json",
+        type=str,
+        default="",
+        help="Explicit path for the final machine-readable JSON report.",
     )
     return parser.parse_args()
 
@@ -682,8 +1042,21 @@ def main() -> int:
     qual_home_parent.mkdir(parents=True, exist_ok=True)
     suffix = uuid.uuid4().hex[:8]
     args.qual_home = str(qual_home_parent / f"run-{suffix}")
+
+    # Write PID file (operator convenience; not part of the evidence).
+    if args.pid_file:
+        Path(args.pid_file).write_text(str(os.getpid()))
+
     run = QualRun(args)
-    report = run.run()
+    try:
+        report = run.run()
+    finally:
+        if args.pid_file and Path(args.pid_file).exists():
+            try:
+                Path(args.pid_file).unlink()
+            except OSError:
+                pass
+
     return 0 if report.get("success") else 2
 
 
