@@ -625,14 +625,154 @@ is recoverable from the audit log under
 ## Current State at Document Time
 
 - `branch`: `integration/fuli-v0.18.2`
-- `HEAD`: `9054f46f44cb9ce9f0b9b070c39d8cdb029fc654` (most recent at
+- `HEAD`: `45e62bba1bd954afa71fa9b47f91d89b52574518` (most recent at
   this document's authored time)
-- Live `~/.hermes/profiles/shadow-pilot/config.yaml`:
+
+## Controlled-Soak Admission-Capacity Failure (2026-07-15)
+
+The seven-day controlled real-provider shadow soak launched at
+`2026-07-15T01:34Z` (`p1-controlled-soak-20260715T013342Z`,
+QUAL_HOME `/tmp/hermes-p1-qualify/run-1fd40a24/`,
+comparisons.db `/tmp/hermes-p1-qualify/run-1fd40a24/memories/comparisons.db`)
+auto-paused at the 03:34Z hourly checkpoint on the **queue_drops**
+hard-pause gate. The auto-pause logic in `99918b54d` worked
+correctly — it caught the failure on the first monitoring
+interval and stopped the run cleanly.
+
+### Truthful statement of what happened
+
+- The 34 queue drops were **NOT** caused by Fuli warm-up.
+- Fuli throughput was well within budget:
+  - 99.2% secondary success rate (127/128)
+  - secondary latency p50 = 82 ms, p95 = 392 ms, max = 6705 ms
+    (one captured Fuli "timed out" envelope)
+  - the producer generated ~0.8 sampled comparisons/minute
+- The defect was in `ComparisonExecutor.enqueue()` in
+  `pilot/comparison_executor.py`. The executor used a
+  `queue.Queue(maxsize=128)` in series with a
+  `ThreadPoolExecutor`. The queue was **never drained** because
+  `ThreadPoolExecutor` consumes its own work via an **unbounded**
+  internal `SimpleQueue` and never reads from the external queue.
+  `put_nowait()` permanently deposited jobs in a queue whose
+  consumer never existed; once 128 jobs had been admitted over
+  the executor's lifetime, the queue was at capacity forever and
+  every subsequent `put_nowait` raised `queue.Full`. From that
+  point on, **all** admitted samples were rejected — regardless
+  of whether the worker was busy or idle.
+- All 128 admitted comparisons were persisted (the
+  `comparison_jobs_persisted` and DB row count matched
+  exactly).
+- The driver's auto-pause correctly stopped accepting new work
+  after the first checkpoint detected `dropped_queue_full > 0`.
+
+### Earlier attribution (now superseded)
+
+A previous draft of this document briefly attributed the 34 drops
+to Fuli warm-up. That diagnosis was wrong. The producer rate
+during Fuli's first 5–10 minutes (when Fuli was loading the
+embedding model and timing out at 6–7 seconds per call) was
+~0.8 sampled comparisons/min, far below the worker's processing
+capacity (~7–8/min sustained). The genuine cause was the executor
+admission-path defect, not Fuli warmup.
+
+### Fix
+
+`b366dd488` `fix(shadow): recycle comparison admission capacity after completion`
+replaces the false queue.Queue admission token with a
+`threading.BoundedSemaphore` of capacity
+`max_queue_size + max_workers`. `enqueue()` non-blockingly
+acquires one permit; the permit is held until
+`_on_comparison_done()` fires (every termination path:
+success, Fuli timeout, Fuli error, future exception, future
+cancellation). Capacity fully recycles after every batch.
+
+`45e62bba1` `test(shadow): add 300-job recycling + submit-failure regression tests`
+adds the 300-job regression and a defensive submit-failure test.
+It also:
+
+- decrements `_jobs_enqueued` and releases the permit if
+  `ThreadPoolExecutor.submit()` itself raises (rare, but
+  possible during pool shutdown), so the executor never leaks
+  capacity on a failed submit;
+- wraps the post-release bookkeeping in `_on_comparison_done`
+  in a `try/except` so the permit release cannot be bypassed by
+  accounting or logging errors;
+- exposes `admission_available` in `executor_accounting()`.
+
+The five-idempotent invariant for `is_balanced()` is now:
+
+  1. `sampled == enqueued + dropped_queue_full`
+  2. `enqueued == started + queue_depth`
+  3. `started == completed + timed_out + failed`
+  4. `completed + timed_out + failed == persisted`
+  5. `outstanding_jobs <= admission_capacity`
+
+Cancellation is folded into `failed` (the cancellation branch
+in `_on_comparison_done` increments `_jobs_failed` exactly once
+because Python's `Future.cancel()` only succeeds on a future
+that has not yet started, so `_run_comparison`'s exception path
+will not also fire). This avoids the brief's
+double-subtraction concern for cancelled terminal jobs.
+
+### Test totals (post-fix)
+
+- `pytest tests/plugins + tests/pilot -q`: 174 passed (was 160
+  before the fix; +12 admission-capacity + 2 new tests)
+- `pytest tests/pilot -W error::ResourceWarning -q`: 138 passed;
+  zero warnings, zero leaks
+- `pytest tests/pilot/test_comparison_admission_capacity.py -v`:
+  14 passed in 27.89 s, including
+  `test_300_jobs_recycle_capacity_past_multiple_lifetime_bounds`
+  and `test_submit_failure_releases_permit_and_no_enqueue_counted`.
+
+### Status of the seven-day soak
+
+The previous seven-day run remains **incomplete and invalid for
+completion**. The 128 persisted rows remain useful provider
+evidence:
+
+- 99.2% secondary success (matches the live system rate)
+- 100% primary hash invariance
+- Privacy / namespace / SQLite / shutdown gates all green
+
+But the run did not reach seven days, and the auto-pause
+proves the admission-path failure mode is now observable in
+practice. The seven-day run is **not** promoted to evidence.
+
+The next session must:
+
+1. Run a controlled **30-minute real-provider capacity
+   qualification** with ≥300 accepted comparisons, against the
+   same provider topology, with `sample_rate` high enough to
+   deterministically exceed 256 admissions in 30 minutes.
+   Required gates (per the post-fix brief):
+   - jobs 129, 256, 300 all admitted and persisted
+   - `dropped_queue_full == 0`
+   - post-flush idle: queue_depth = active_jobs = outstanding_jobs
+     = 0, admission_available = admission_capacity
+   - Fuli secondary success ≥ 90%, primary hash invariance 100%,
+     enqueue p95 < 10 ms
+   - redacted export clean, SQLite integrity / quick-check
+     / wal_checkpoint clean, clean shutdown
+2. **Only after the 30-minute qualification passes**, seek a
+   separate, explicit user approval to relaunch the seven-day
+   controlled soak with the admission-capacity fix in place.
+
+The queue-drop auto-pause gate has not been weakened, relaxed,
+or removed. It fired correctly on the 2026-07-15 soak and will
+fire correctly on the next soak if admission capacity ever
+leaks again.
+
+## Operator Enablement
   - `compare_reads: false`
   - `sample_rate: 0.0`
   - `mirror_writes: true` (preserved)
   - config.yaml SHA-256:
     `359ece27ffd508e277ace2a278b5754ec45325e326e6dce00772ea59f4d77882`
+- Live `~/.hermes/profiles/shadow-pilot/config.yaml`:
+  - `compare_reads: false`
+  - `sample_rate: 0.0`
+  - `mirror_writes: true` (preserved)
 - Default Hermes profile (`~/.hermes/config.yaml`): **untouched**
 - Default Hermes gateway (PID 45422): **not restarted**
 - Default Hermes dashboard (PID 40765): **not restarted**
