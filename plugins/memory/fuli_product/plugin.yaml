@@ -1,0 +1,6 @@
+name: fuli_product
+description: Fuli Memory for Hermes — lifecycle, observability, and migration manager.
+version: 0.1.0-rc1
+author: Tiny Little Lab
+requires:
+  hermes: ">=0.18.2,<0.20.0"
