@@ -1,6 +1,6 @@
 {
-  "head_sha": "78c06525e8e955e06a007b07b347c679f3977c3e",
-  "head_short": "78c06525e",
+  "head_sha": "d289ea433e69f15ee1260227c2a7f642f50021f2",
+  "head_short": "d289ea433",
   "product_commit": "29bc8af0b0f1de9a35cf7fa66581fc9df4750faf",
   "python_version": "3.11.14",
   "qualified_commit": "cfb9535cd38243988d0298771350c048885cf375",
@@ -8,7 +8,7 @@
     {
       "boot": "ok",
       "cli": "ok",
-      "commit_sha": "78c06525e8e955e06a007b07b347c679f3977c3e",
+      "commit_sha": "d289ea433e69f15ee1260227c2a7f642f50021f2",
       "config": "ok",
       "error_category": "",
       "label": "origin/main (no Fuli product, no qualified runtime)",
@@ -36,7 +36,7 @@
     {
       "boot": "ok",
       "cli": "ok",
-      "commit_sha": "78c06525e8e955e06a007b07b347c679f3977c3e",
+      "commit_sha": "d289ea433e69f15ee1260227c2a7f642f50021f2",
       "config": "ok",
       "error_category": "",
       "label": "origin/main + qualified runtime (pilot/, shadow plugin)",
@@ -64,7 +64,7 @@
     {
       "boot": "ok",
       "cli": "ok",
-      "commit_sha": "78c06525e8e955e06a007b07b347c679f3977c3e",
+      "commit_sha": "d289ea433e69f15ee1260227c2a7f642f50021f2",
       "config": "ok",
       "error_category": "",
       "label": "origin/main + qualified runtime + product",
@@ -99,7 +99,7 @@
     {
       "boot": "ok",
       "cli": "ok",
-      "commit_sha": "78c06525e8e955e06a007b07b347c679f3977c3e",
+      "commit_sha": "d289ea433e69f15ee1260227c2a7f642f50021f2",
       "config": "ok",
       "error_category": "",
       "label": "Fuli package unavailable",
@@ -127,7 +127,7 @@
     {
       "boot": "ok",
       "cli": "ok",
-      "commit_sha": "78c06525e8e955e06a007b07b347c679f3977c3e",
+      "commit_sha": "d289ea433e69f15ee1260227c2a7f642f50021f2",
       "config": "ok",
       "error_category": "",
       "label": "legacy shadow config migration",
@@ -157,7 +157,7 @@
     {
       "boot": "ok",
       "cli": "ok",
-      "commit_sha": "78c06525e8e955e06a007b07b347c679f3977c3e",
+      "commit_sha": "d289ea433e69f15ee1260227c2a7f642f50021f2",
       "config": "ok",
       "error_category": "",
       "label": "rollback to Honcho-only",
@@ -174,7 +174,7 @@
         "ok": true,
         "result": {
           "action": "rollback",
-          "backup_path": "memory:/in-memory-config.Fuli_rollback.20260726-153954.bak",
+          "backup_path": "memory:/in-memory-config.Fuli_rollback.20260726-155431.bak",
           "mode": "off",
           "target_provider": "honcho"
         }
@@ -185,7 +185,7 @@
     {
       "boot": "ok",
       "cli": "ok",
-      "commit_sha": "78c06525e8e955e06a007b07b347c679f3977c3e",
+      "commit_sha": "d289ea433e69f15ee1260227c2a7f642f50021f2",
       "config": "ok",
       "error_category": "",
       "label": "corrupt comparison DB",
@@ -214,7 +214,7 @@
     {
       "boot": "ok",
       "cli": "ok",
-      "commit_sha": "78c06525e8e955e06a007b07b347c679f3977c3e",
+      "commit_sha": "d289ea433e69f15ee1260227c2a7f642f50021f2",
       "config": "ok",
       "error_category": "",
       "label": "restart after auto-pause",
@@ -240,6 +240,6 @@
     }
   ],
   "schema_version": 1,
-  "tag": "v2026.7.20-1277-g78c06525e",
+  "tag": "v2026.7.20-1282-gd289ea433",
   "worktree": "/Users/caiado/.hermes/worktrees/hermes-fuli-compat"
 }

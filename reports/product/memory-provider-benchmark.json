@@ -1,0 +1,74 @@
+{
+  "dependency_footprint": {
+    "fuli": false,
+    "hindsight": false,
+    "honcho": false,
+    "mnemosyne": false
+  },
+  "head_sha": "d289ea433e69f15ee1260227c2a7f642f50021f2",
+  "head_short": "d289ea433",
+  "python_version": "3.11.14",
+  "results": {
+    "fuli": {
+      "capabilities": {
+        "contradiction_detection": true,
+        "embedded": true,
+        "graph_links": false,
+        "retrieval_modes": [
+          "exact",
+          "hybrid",
+          "semantic"
+        ],
+        "server_mode": false,
+        "typed_schema": true
+      },
+      "latency_overhead_ms": 8.0,
+      "measurements": {
+        "latency_max_ms": 0.05116697866469622,
+        "latency_p50_ms": 0.0025419285520911217,
+        "latency_p95_ms": 0.004125060513615608,
+        "recall_hits": 0,
+        "recall_rate": 0.0,
+        "total_queries": 200
+      },
+      "present": true,
+      "provenance": {
+        "provider": "fuli",
+        "version": "stub"
+      }
+    },
+    "hindsight": {
+      "present": false
+    },
+    "honcho": {
+      "capabilities": {
+        "contradiction_detection": false,
+        "embedded": true,
+        "graph_links": false,
+        "retrieval_modes": [
+          "hybrid"
+        ],
+        "server_mode": false,
+        "typed_schema": false
+      },
+      "latency_overhead_ms": 5.0,
+      "measurements": {
+        "latency_max_ms": 0.005249981768429279,
+        "latency_p50_ms": 0.002500019036233425,
+        "latency_p95_ms": 0.004209112375974655,
+        "recall_hits": 0,
+        "recall_rate": 0.0,
+        "total_queries": 200
+      },
+      "present": true,
+      "provenance": {
+        "provider": "honcho",
+        "version": "stub"
+      }
+    },
+    "mnemosyne": {
+      "present": false
+    }
+  },
+  "schema_version": 1
+}

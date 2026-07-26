@@ -1,9 +1,9 @@
 # Phase 5 current-main compatibility matrix
 
 - worktree: `/Users/caiado/.hermes/worktrees/hermes-fuli-compat`
-- head_sha: `78c06525e8e955e06a007b07b347c679f3977c3e`
-- head_short: `78c06525e`
-- tag: `v2026.7.20-1277-g78c06525e`
+- head_sha: `d289ea433e69f15ee1260227c2a7f642f50021f2`
+- head_short: `d289ea433`
+- tag: `v2026.7.20-1282-gd289ea433`
 - python_version: `3.11.14`
 - product_commit: `29bc8af0b0f1de9a35cf7fa66581fc9df4750faf`
 - qualified_commit: `cfb9535cd38243988d0298771350c048885cf375`
