@@ -1,0 +1,26 @@
+schema_version: 1
+mode: off
+previous_mode: ""
+primary_provider: honcho
+secondary_provider: fuli
+namespace: hermes:shadow-pilot
+mirror_writes: false
+compare_reads: false
+sample_rate: 0.0
+sampling_seed: 0
+comparison:
+  budget_ms: 2000
+  workers: 1
+  queue_size: 1024
+privacy:
+  capture_content: false
+rollback:
+  previous_provider: honcho
+  auto_rollback_on:
+    - primary_mutation
+    - namespace_violation
+    - raw_content_leak
+quality:
+  min_secondary_success_rate: 0.90
+  min_adjudicated_samples: 100
+  max_queue_drops: 0
