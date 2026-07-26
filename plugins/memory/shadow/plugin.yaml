@@ -1,0 +1,4 @@
+name: shadow
+version: 1.0.0
+description: "Honcho-primary / Fuli-shadow memory provider. Mirrors writes and compares reads without affecting live answers."
+pip_dependencies: []
