@@ -1,0 +1,245 @@
+{
+  "head_sha": "78c06525e8e955e06a007b07b347c679f3977c3e",
+  "head_short": "78c06525e",
+  "product_commit": "29bc8af0b0f1de9a35cf7fa66581fc9df4750faf",
+  "python_version": "3.11.14",
+  "qualified_commit": "cfb9535cd38243988d0298771350c048885cf375",
+  "scenarios": [
+    {
+      "boot": "ok",
+      "cli": "ok",
+      "commit_sha": "78c06525e8e955e06a007b07b347c679f3977c3e",
+      "config": "ok",
+      "error_category": "",
+      "label": "origin/main (no Fuli product, no qualified runtime)",
+      "migration": "n/a",
+      "pass_fail": "PASS",
+      "persistence": "n/a",
+      "provider_availability": "n/a",
+      "python_version": "3.11.14",
+      "raw": {
+        "boot": "ok",
+        "cli": "ok",
+        "config": "ok",
+        "id": "A",
+        "label": "origin/main (no Fuli product, no qualified runtime)",
+        "ok": true,
+        "result": {
+          "boots": true,
+          "config_loads": true,
+          "hermes_cli_path": "/Users/caiado/.hermes/worktrees/hermes-fuli-compat/hermes_cli/__init__.py"
+        }
+      },
+      "rollback": "n/a",
+      "scenario_id": "A"
+    },
+    {
+      "boot": "ok",
+      "cli": "ok",
+      "commit_sha": "78c06525e8e955e06a007b07b347c679f3977c3e",
+      "config": "ok",
+      "error_category": "",
+      "label": "origin/main + qualified runtime (pilot/, shadow plugin)",
+      "migration": "n/a",
+      "pass_fail": "PASS",
+      "persistence": "n/a",
+      "provider_availability": "n/a",
+      "python_version": "3.11.14",
+      "raw": {
+        "boot": "ok",
+        "config": "ok",
+        "id": "B",
+        "label": "origin/main + qualified runtime (pilot/, shadow plugin)",
+        "ok": true,
+        "result": {
+          "ComparisonExecutor_class": "ComparisonExecutor",
+          "ComparisonStore_class": "ComparisonStore",
+          "pilot_imports": true,
+          "shadow_provider": "ShadowMemoryProvider"
+        }
+      },
+      "rollback": "n/a",
+      "scenario_id": "B"
+    },
+    {
+      "boot": "ok",
+      "cli": "ok",
+      "commit_sha": "78c06525e8e955e06a007b07b347c679f3977c3e",
+      "config": "ok",
+      "error_category": "",
+      "label": "origin/main + qualified runtime + product",
+      "migration": "n/a",
+      "pass_fail": "PASS",
+      "persistence": "n/a",
+      "provider_availability": "n/a",
+      "python_version": "3.11.14",
+      "raw": {
+        "boot": "ok",
+        "config": "ok",
+        "id": "C",
+        "label": "origin/main + qualified runtime + product",
+        "ok": true,
+        "result": {
+          "lifecycle_imports": true,
+          "reporter_keys": [
+            "comparison_metrics",
+            "compatibility",
+            "database_integrity",
+            "executor_accounting",
+            "generated_at",
+            "hard_gates"
+          ],
+          "reporter_mode": "shadow",
+          "reporter_state": "unavailable"
+        }
+      },
+      "rollback": "n/a",
+      "scenario_id": "C"
+    },
+    {
+      "boot": "ok",
+      "cli": "ok",
+      "commit_sha": "78c06525e8e955e06a007b07b347c679f3977c3e",
+      "config": "ok",
+      "error_category": "",
+      "label": "Fuli package unavailable",
+      "migration": "n/a",
+      "pass_fail": "PASS",
+      "persistence": "n/a",
+      "provider_availability": false,
+      "python_version": "3.11.14",
+      "raw": {
+        "boot": "ok",
+        "cli": "ok",
+        "config": "ok",
+        "id": "D",
+        "label": "Fuli package unavailable",
+        "ok": true,
+        "result": {
+          "class": "FuliMemoryProvider",
+          "cli_doctor_ok": true,
+          "is_available": false
+        }
+      },
+      "rollback": "n/a",
+      "scenario_id": "D"
+    },
+    {
+      "boot": "ok",
+      "cli": "ok",
+      "commit_sha": "78c06525e8e955e06a007b07b347c679f3977c3e",
+      "config": "ok",
+      "error_category": "",
+      "label": "legacy shadow config migration",
+      "migration": "shadow",
+      "pass_fail": "PASS",
+      "persistence": "n/a",
+      "provider_availability": "n/a",
+      "python_version": "3.11.14",
+      "raw": {
+        "boot": "ok",
+        "config": "ok",
+        "id": "E",
+        "label": "legacy shadow config migration",
+        "ok": true,
+        "result": {
+          "legacy_preserved": true,
+          "memory_keys": [
+            "fuli_product",
+            "shadow"
+          ],
+          "migrated_mode": "shadow"
+        }
+      },
+      "rollback": "n/a",
+      "scenario_id": "E"
+    },
+    {
+      "boot": "ok",
+      "cli": "ok",
+      "commit_sha": "78c06525e8e955e06a007b07b347c679f3977c3e",
+      "config": "ok",
+      "error_category": "",
+      "label": "rollback to Honcho-only",
+      "migration": "n/a",
+      "pass_fail": "PASS",
+      "persistence": "n/a",
+      "provider_availability": "n/a",
+      "python_version": "3.11.14",
+      "raw": {
+        "boot": "ok",
+        "config": "ok",
+        "id": "F",
+        "label": "rollback to Honcho-only",
+        "ok": true,
+        "result": {
+          "action": "rollback",
+          "backup_path": "memory:/in-memory-config.Fuli_rollback.20260726-153954.bak",
+          "mode": "off",
+          "target_provider": "honcho"
+        }
+      },
+      "rollback": "honcho",
+      "scenario_id": "F"
+    },
+    {
+      "boot": "ok",
+      "cli": "ok",
+      "commit_sha": "78c06525e8e955e06a007b07b347c679f3977c3e",
+      "config": "ok",
+      "error_category": "",
+      "label": "corrupt comparison DB",
+      "migration": "n/a",
+      "pass_fail": "PASS",
+      "persistence": 0,
+      "provider_availability": "n/a",
+      "python_version": "3.11.14",
+      "raw": {
+        "boot": "ok",
+        "config": "ok",
+        "id": "G",
+        "label": "corrupt comparison DB",
+        "ok": true,
+        "result": {
+          "balanced": true,
+          "enqueue_accepted": true,
+          "note": "executor must remain consistent even when persistence worker fails",
+          "persistence_failed": 0,
+          "sampled": 1
+        }
+      },
+      "rollback": "n/a",
+      "scenario_id": "G"
+    },
+    {
+      "boot": "ok",
+      "cli": "ok",
+      "commit_sha": "78c06525e8e955e06a007b07b347c679f3977c3e",
+      "config": "ok",
+      "error_category": "",
+      "label": "restart after auto-pause",
+      "migration": "n/a",
+      "pass_fail": "PASS",
+      "persistence": "n/a",
+      "provider_availability": "n/a",
+      "python_version": "3.11.14",
+      "raw": {
+        "boot": "ok",
+        "config": "ok",
+        "id": "H",
+        "label": "restart after auto-pause",
+        "ok": true,
+        "result": {
+          "final_mode": "off",
+          "previous_mode": "paused",
+          "transitions_clean": true
+        }
+      },
+      "rollback": "n/a",
+      "scenario_id": "H"
+    }
+  ],
+  "schema_version": 1,
+  "tag": "v2026.7.20-1277-g78c06525e",
+  "worktree": "/Users/caiado/.hermes/worktrees/hermes-fuli-compat"
+}
