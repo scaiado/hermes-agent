@@ -1,0 +1,117 @@
+{
+  "n_passed": 15,
+  "n_scenarios": 15,
+  "results": [
+    {
+      "counts": {
+        "fuli": 101,
+        "honcho": 9899
+      },
+      "fuli_within_tolerance": true,
+      "n_users": 10000,
+      "passed": true,
+      "scenario": "1pct_deterministic_assignment",
+      "stable_across_runs": true
+    },
+    {
+      "allowlist_pinned": true,
+      "assignments": {
+        "regular-user": "honcho",
+        "vip1": "fuli",
+        "vip2": "fuli"
+      },
+      "passed": true,
+      "scenario": "explicit_allowlist"
+    },
+    {
+      "cohort": "honcho",
+      "passed": true,
+      "provider": "honcho",
+      "routes_to_honcho": true,
+      "scenario": "fuli_unavailable_before_request"
+    },
+    {
+      "fallback_used": false,
+      "final_provider": "honcho",
+      "passed": true,
+      "scenario": "fuli_fails_during_request"
+    },
+    {
+      "fallback_used": false,
+      "final_provider": "honcho",
+      "passed": true,
+      "scenario": "fuli_timeout"
+    },
+    {
+      "honcho": true,
+      "passed": true,
+      "provider": "honcho",
+      "scenario": "honcho_fallback_succeeds"
+    },
+    {
+      "deterministic": true,
+      "error_envelope_safe": true,
+      "passed": true,
+      "router_decision_provider": "honcho",
+      "scenario": "both_providers_fail"
+    },
+    {
+      "kill_switch_overrides": false,
+      "passed": true,
+      "post_kill_provider": "honcho",
+      "pre_kill_provider": "honcho",
+      "scenario": "kill_switch_during_active_request"
+    },
+    {
+      "gate_fires": false,
+      "passed": true,
+      "scenario": "automatic_rollback_on_persistence_failure"
+    },
+    {
+      "gate_fires": true,
+      "passed": true,
+      "scenario": "automatic_rollback_on_namespace_violation"
+    },
+    {
+      "gate_fires": true,
+      "passed": true,
+      "scenario": "automatic_rollback_on_raw_content_leak"
+    },
+    {
+      "final_mode": "shadow",
+      "passed": true,
+      "previous_mode": "off",
+      "scenario": "restart_after_rollback"
+    },
+    {
+      "backup_path_returned": true,
+      "byte_identical": true,
+      "passed": true,
+      "scenario": "config_backup_and_restoration"
+    },
+    {
+      "decision_cohort": "honcho",
+      "decision_hash": "5f6c33ec90578fa1",
+      "decision_provider": "honcho",
+      "passed": true,
+      "provenance_complete": true,
+      "scenario": "metrics_provenance"
+    },
+    {
+      "decision_fields": [
+        "allowlisted",
+        "canary_percentage",
+        "cohort",
+        "deterministic_hash",
+        "fallback_provider",
+        "mode",
+        "provider",
+        "user_id"
+      ],
+      "no_forbidden_fields": true,
+      "passed": true,
+      "scenario": "no_payload_written_to_logs"
+    }
+  ],
+  "schema_version": 1
+}

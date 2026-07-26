@@ -93,3 +93,44 @@ This analysis is based on the public Mnemosyne feature inventory
 the user mentioned in the mission and on the Fuli product's
 existing scope. It is not derived from a fresh code review of
 Mnemosyne's repository in this mission.
+
+## Post-evidence experiment plan
+
+After the Fuli 1% canary is approved and the qualification
+evidence is complete, the following isolated experiment
+exercises Mnemosyne's local-only mode against the same
+representative corpus. **It is a research comparison, not a
+production candidate.**
+
+- **Mode**: Mnemosyne local-only installation in a separate
+  virtual environment. No orchestration, no collaborative
+  editor, no networking layer. Per the mission directive,
+  those are explicitly out of scope.
+- **Corpus**: the same `reports/product/fuli-evaluation-corpus.json`.
+  No new corpora.
+- **Namespace**: a fresh, isolated Mnemosyne namespace; no
+  cross-contamination.
+- **Benchmark dimensions**:
+  - Typed memory schema — Mnemosyne's per-type fields
+    versus Fuli's `query_type` taxonomy.
+  - Supersession / contradiction lifecycle — Mnemosyne's
+    supersede relationships versus Fuli's
+    `query_type=contradiction` taxonomy.
+  - Consolidation — Mnemosyne's background consolidation
+    versus Fuli's lack of consolidation.
+  - Decay and archival — Mnemosyne's importance
+    recalibration versus Fuli's static-freshness model.
+  - Privacy-safe online feedback — Mnemosyne's feedback
+    signal versus Fuli's blind adjudication outcome.
+  - Local operational complexity — installation time,
+    configuration surface, dependency footprint.
+  - Quality — same blind adjudication workflow, same
+    reviewer, same outcome codes. 100-adjudication minimum.
+  - Resource footprint — RSS delta, peak memory, time to
+    retain/recall 1000 cases.
+- **Reporting**: results land in
+  `reports/product/mnemosyne-experiment.json` and
+  `docs/research/mnemosyne-experiment-results.md`.
+- **Constraint**: Mnemosyne is installed in a separate venv.
+  The Fuli runtime venv, the live profiles, and the
+  Fuli product are untouched.

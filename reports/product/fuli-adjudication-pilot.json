@@ -1,0 +1,18 @@
+{
+  "close_required_before_mapping": true,
+  "cross_reviewer_recorded": true,
+  "duplicate_rejected": true,
+  "identity_leak": false,
+  "mapping_ok": true,
+  "n": 20,
+  "n_assignments": 20,
+  "n_audit_events": 21,
+  "n_outcomes_by_type": {
+    "both_bad": 2,
+    "candidate_a_better": 7,
+    "candidate_b_better": 5,
+    "insufficient_evidence": 2,
+    "tie": 4
+  },
+  "schema_version": 1
+}

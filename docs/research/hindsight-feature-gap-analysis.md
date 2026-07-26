@@ -115,3 +115,45 @@ This analysis is based on the public Hindsight feature inventory
 the user mentioned in the mission and on the Fuli product's
 existing scope. It is not derived from a fresh code review of
 Hindsight's repository in this mission.
+
+## Post-evidence experiment plan
+
+After the Fuli 1% canary is approved and the qualification
+evidence is complete, the following isolated experiment
+exercises Hindsight's embedded mode against the same
+representative corpus. **It is a research comparison, not a
+production candidate.**
+
+- **Mode**: Hindsight embedded Python only (no Docker, no
+  server). The Hindsight package is installed in a separate
+  virtual environment; the existing Fuli runtime is
+  untouched.
+- **Corpus**: the same `reports/product/fuli-evaluation-corpus.json`
+  used for the Fuli evaluation. No new corpora.
+- **Namespace**: a fresh, isolated Hindsight namespace; no
+  cross-contamination with the Fuli evaluation namespace.
+- **Benchmark dimensions**:
+  - retain/recall/reflect API surface — exercised through
+    Hindsight's Python bindings.
+  - Hybrid retrieval fusion (semantic + keyword + graph +
+    temporal) — Hindsight's built-in parallel retrievers +
+    RRF; measured against Fuli's single-method retrieval.
+  - Temporal retrieval — Hindsight's date-bounded recall
+    versus Fuli's `recent` / `episodic` query types.
+  - Reflection — Hindsight's background mental-model
+    generation; Fuli has no equivalent, so the comparison
+    is qualitative (does Fuli need a reflect API?).
+  - Resource footprint — RSS delta, peak memory, time to
+    retain/recall 1000 cases.
+  - Quality — same blind adjudication workflow, same
+    reviewer, same outcome codes. The 100-adjudication
+    minimum applies; the Hindsight arm produces 100
+    blind-adjudicated cases; the non-inferiority calculator
+    is reused unchanged.
+- **Reporting**: results land in
+  `reports/product/hindsight-experiment.json` and
+  `docs/research/hindsight-experiment-results.md`.
+- **Constraint**: the Hindsight package is installed in a
+  separate venv; the Fuli runtime venv and the live
+  profiles are untouched. The Fuli product is not modified
+  to consume Hindsight.
